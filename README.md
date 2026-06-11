@@ -39,19 +39,19 @@ Each node handles its own:
 
 **Scaling is done by stacking nodes, not redesigning them.** Need a 16S4P powerwall? Stack four nodes in series, populate the CAN/isolation section (~€5 of parts per board), and they join a shared bus reporting to a master aggregator. Same PCB, same firmware, no redesign.
 
-For the speaker build: CAN section unpopulated. Node runs standalone with UART to the amp board ESP32.
+For the speaker build: CAN section unpopulated. Node runs standalone — the BMS ESP32 manages everything including charger board communication.
 
 ### 1.2 Power Architecture Summary
 
 | Stage | Function | Key Spec |
 |---|---|---|
-| USB-C PD Input | Negotiate 5–20V from any adapter via FUSB302 | PD2.0 / PD3.0 / QC3.0, sink and source |
-| BQ25713B Buck-Boost | Charge: any PD voltage → 16.8V CC/CV. OTG: pack → 5V/9V on VBUS | 4-switch, 4× external FETs, 1 inductor, I2C |
+| USB-C PD Input | Negotiate 5–20V from any adapter via FUSB302 | PD2.0 / PD3.0 / QC3.0, sink and source. FUSB302 controlled by BMS ESP32. |
+| BQ25713B Buck-Boost | Charge: any PD voltage → 16.8V CC/CV. OTG: pack → 5V/9V on VBUS | 4-switch, 4× external FETs, 1 inductor, I2C to BMS ESP32 |
 | 4S2P Li-ion Pack | 14.8V nom / 16.8V full / 12.0V cutoff | 8× 18650, 2 per series group |
 | BQ76920 | All measurement + hardware protection | ±1mV cell voltage, pack current, 2× NTC |
 | ESP32-S3 (bare SoC) | Intelligence: balancing, SOC, comms, webapp | Deep sleep ~10µA, native USB pads |
 | Active Balancer | 3× discrete FET pairs + inductors, ESP32-driven | Inductive, any-to-any, ~88% efficient |
-| AP2112K-3.3 LDO | 3.3V for ESP32-S3 + BQ76920 logic | 600mA, low dropout, SOT-23-5 |
+| AP63203 Buck | 3.3V fixed from B+ (12–16.8V) for all logic | Synchronous buck, SOT-23-6, ~50µA IQ. Powers ESP32-S3 + BQ76920 + FUSB302 + BQ25713B logic. Sourced from B+ so ESP32 stays alive regardless of protection FET state. |
 | TAS5825M Amp | PVDD from BMS P+/P− | 16.8V → ~2×25W @ 4Ω |
 
 ### 1.3 Cell Configuration: 4S2P with 18650
@@ -170,7 +170,7 @@ Bare ESP32-S3 SoC (QFN-56), 8MB NOR flash (W25Q64JVSSIQ, WSON-8), 40MHz crystal,
 | U2 | ESP32-S3 SoC | QFN-56 | Native USB, TWAI, LEDC, WiFi/BT. No module — full RF control. |
 | U_FL | NOR Flash | W25Q64JVSSIQ 8MB WSON-8 | QSPI to FSPI pins. 100nF + 1µF at VCC. |
 | X1 | Crystal | 40MHz ±10ppm, 3225 | Epson FA-238 or equiv. Load caps per CL spec — typically 2×15pF at CL=10pF. |
-| U3 | 3.3V LDO | **AP2112K-3.3TRG1** | 600mA, 300mV dropout, SOT-23-5. Powers ESP32-S3 + BQ76920 logic. Low quiescent — critical for sleep budget. |
+| U3 | 3.3V Buck | **AP63203** (Diodes Inc.) | SOT-23-6. 3.8–32V input, 3.3V fixed output, 3A. Sourced from B+ — powers ESP32-S3 + BQ76920 + FUSB302 + BQ25713B logic regardless of protection FET state. ~50µA IQ. |
 
 #### Crystal layout rules
 
@@ -207,17 +207,48 @@ The antenna is a tuned 50Ω microstrip. **No copper on any layer** (top, inner p
 
 Each cap within 0.5mm of its respective pin. Map datasheet pin table to physical QFN-56 pad locations before placement.
 
-#### Power budget (60s wake interval)
+#### Power budget — deep sleep current breakdown
 
-| State | Current |
-|---|---|
-| Deep sleep | ~10µA |
-| Active (balance / UART / fault) | ~80mA |
-| WiFi webapp | ~120–180mA |
+All figures from B+ rail (pack voltage), accounting for AP63203 buck efficiency (~70% at ultra-light load).
 
-Average: (0.1s × 80mA + 59.9s × 0.01mA) / 60 ≈ **0.14mA** → ~0.2mAh/day from 6Ah pack. Negligible.
+| Component | Deep sleep (FUSB302 active) | Deep sleep (FUSB302 low-power) | Notes |
+|---|---|---|---|
+| AP63203 buck IQ | ~50µA | ~50µA | Quiescent at light load |
+| ESP32-S3 | ~10µA | ~10µA | RTC timer + GPIO wake active only |
+| BQ76920 | ~3µA | ~3µA | Cell monitoring + protection always running, drawn from REGSRC not 3.3V rail |
+| FUSB302 | ~125µA | **~10µA** | DRP toggling vs low-power unattached mode |
+| BQ25713B | ~50µA | ~50µA | Idle register state |
+| All other (leakage, pull-downs) | ~2µA | ~2µA | — |
+| **3.3V rail total** | **~240µA** | **~125µA** | — |
+| **From B+ (÷ buck η ~70%)** | **~340µA** | **~180µA** | Actual pack drain |
 
-**Wake sources:** RTC timer · BQ76920 ALERT GPIO interrupt · UART RX · CAN RX GPIO edge (node mode only).
+**The FUSB302 in DRP toggling mode is the dominant consumer** — more than all other components combined. Writing `CONTROL2` register to disable DRP toggling before entering deep sleep drops it to ~10µA. The FUSB302 INT pin remains active at this quiescent level and still fires on cable attach/detach, so wake capability is fully preserved.
+
+**Pre-sleep sequence (firmware):**
+1. Write FUSB302 `CONTROL2`: disable DRP toggling → unattached low-power mode
+2. Write BQ25713B: disable ADC continuous conversion → idle mode
+3. Configure ESP32 wake sources (RTC timer, ALERT GPIO, UART RX, FUSB302 INT)
+4. Enter deep sleep
+
+**On wake from FUSB302 INT:** immediately re-enable DRP toggling in FUSB302 before reading CC status, so role detection is fresh.
+
+**Pack drain per day:**
+
+| Scenario | Daily drain | Runtime on 6Ah (self-discharge aside) |
+|---|---|---|
+| FUSB302 active (no sleep optimisation) | 340µA × 24h = **8.2mAh/day** | ~730 days |
+| FUSB302 low-power (recommended) | 180µA × 24h = **4.3mAh/day** | ~1400 days |
+
+Both are well below cell self-discharge (~60–180mAh/month on a 6Ah pack). The FUSB302 low-power mode is a one-register write — implement it.
+
+**Average current across a 60s balance cycle (active 100ms, sleep 59.9s, FUSB302 low-power):**
+
+```
+(0.1s × 80mA + 59.9s × 0.18mA) / 60s = (8mAs + 10.78mAs) / 60s ≈ 0.31mA average
+→ ~7.5mAh/day total — still negligible from a 6Ah pack
+```
+
+**Wake sources:** RTC timer (balance interval, NVS-configurable) · BQ76920 ALERT GPIO (any protection fault, immediate) · UART RX (host command) · FUSB302 INT GPIO (USB-C cable attach/detach) · CAN RX GPIO edge (node mode only).
 
 ### 2.5 Programming Interface — Native USB Pads
 
@@ -245,7 +276,7 @@ Route D+/D− as matched-length differential pair, no vias.
 |---|---|---|---|---|---|
 | U1 | AFE / protection | TI BQ76920 | TSSOP-20 | 1 | ±1mV cell groups, I2C 0x08, OVP/UVP/OCD/SCD/OCC, CHG+DSG FET drive, ALERT. Mouser/Digikey stocked. |
 | U2 | MCU | ESP32-S3 bare SoC | QFN-56 | 1 | Native USB, TWAI, LEDC, WiFi. Bare SoC — see §2.4 for full subsystem. |
-| U3 | 3.3V LDO | AP2112K-3.3TRG1 | SOT-23-5 | 1 | 600mA, 300mV dropout. Powers ESP32-S3 + BQ76920. Low IQ — critical for sleep budget. |
+| U3 | 3.3V Buck | AP63203 (Diodes Inc.) | SOT-23-6 | 1 | 3.8–32V input, 3.3V fixed output, 3A, synchronous buck. Sourced from B+ — ESP32 stays powered regardless of protection FET state. ~50µA IQ at light load — negligible sleep impact. Add 10µF input + 22µF output caps + shielded inductor per datasheet. |
 | U_FL | NOR Flash | W25Q64JVSSIQ 8MB | WSON-8 | 1 | QSPI interface. 100nF + 1µF at VCC. |
 | X1 | Crystal | 40MHz ±10ppm | 3225 | 1 | E.g. Epson FA-238. 2× load caps per CL spec. |
 | Q1 | CHG FET | AON6354 30V 83A 5.2mΩ | DFN5×6 | 1 | Back-to-back on B− rail. Driven by BQ76920 CHG pin. Exposed pad → PCB copper pour for thermal spreading. |
@@ -270,7 +301,9 @@ Route D+/D− as matched-length differential pair, no vias.
 | C6–C9 | VC filter C | 0.1µF ×4 | 0402 | 4 | At VC pins to GND. With R6–R9: cutoff ~16kHz. |
 | C10–C12 | Balancer bootstrap | 100nF ×3 | 0402 | 3 | One per balancer instance. |
 | C13–C22 | ESP32-S3 decoupling | 10µF + 100nF per VDD domain | 0402/0805 | 10 | Five VDD domains: VDD3P3, VDD3P3_RTC, VDD3P3_CPU, VDD_SDIO, VDD3P3_USB. Within 0.5mm each. |
-| C23 | LDO output | 10µF X7R | 0805 | 1 | AP2112K output stability. |
+| C23 | Buck input cap | 10µF 25V X7R | 0805 | 1 | AP63203 VIN decoupling. Place within 1mm of VIN pin. |
+| C24 | Buck output cap | 22µF 10V X7R | 0805 | 1 | AP63203 output. Per datasheet recommendation for 3.3V output stability. |
+| L_PWR | Buck inductor | 3.3µH or 4.7µH Isat ≥1A shielded | 4×4mm | 1 | AP63203 power inductor. Shielded — place away from ESP32 antenna and BQ76920 VC sense lines. |
 | C_X1, C_X2 | Crystal load caps | ~15pF (verify per CL) | 0402 | 2 | Symmetric placement at crystal pads. |
 | NTC1 | Cell NTC | 100kΩ B=3950 | leaded | 1 | Epoxied to cell body → BQ76920 TS1. |
 | NTC2 | FET NTC | 100kΩ B=3950 | 0402 | 1 | Near Q1/Q2 → BQ76920 TS2. |
@@ -311,6 +344,8 @@ Power at trip: 18.7² × 0.003 = 1.05W → 2W rated 2512
 Kelvin 4-wire connection to BQ76920 SRP/SRN pins is mandatory — see layout §2.9.
 
 ### 2.9 BMS Layout Rules
+
+**AP63203 buck converter:** place inductor (L_PWR) and output cap (C24) as close as possible to the IC SW and output pins — standard buck layout rules. Shielded inductor mandatory. Keep the switching loop (VIN → IC → L_PWR → C24 → GND) away from the antenna keepout zone and away from BQ76920 VC sense lines — the 3.3V buck switches at ~1.5MHz, which is within the range that can couple into VC traces if carelessly placed.
 
 **High-current path** (`B− → D1 → Q1 → shared node → R1 → Q2 → P−`): polygon pours ≥3.5mm at 2oz. Cluster 6–8 vias (0.4mm drill) in parallel if layer change unavoidable. No single vias on 12A+ paths.
 
@@ -390,30 +425,47 @@ Each node balances its own 4 groups autonomously. Inter-node balance is the mast
 
 The charger board uses two ICs with a clean separation of responsibility:
 
-- **FUSB302:** USB-C PD physical layer. Detects what is plugged in (source or sink via CC pin monitoring). Negotiates PD voltage as sink. Advertises capabilities as source. Communicates everything to the amp ESP32 over I2C.
-- **BQ25713B:** 4-switch buck-boost charger controller. Receives instructions from amp ESP32 over I2C. Charges the 4S pack in sink mode. Outputs 5V or 9V on VBUS in OTG mode. Never makes autonomous role decisions — the ESP32 is always the decision maker.
+- **FUSB302:** USB-C PD physical layer. Detects what is plugged in (source or sink via CC pin monitoring). Negotiates PD voltage as sink. Advertises capabilities as source. Communicates over I2C to the **BMS ESP32**.
+- **BQ25713B:** 4-switch buck-boost charger controller. Receives instructions from the **BMS ESP32** over I2C. Charges the 4S pack in sink mode. Outputs 5V or 9V on VBUS in OTG mode. Never makes autonomous role decisions — the BMS ESP32 is always the decision maker.
 
-The amp ESP32 is the arbiter:
+The charger board connects to the BMS board via:
+- **I2C:** shared bus carrying FUSB302 (0x22) and BQ25713B (0x6B) — routed to BMS ESP32 SDA/SCL via a dedicated connector
+- **XT30:** CHG+/CHG− power path to BMS J3
+- **JST-XH:** cell tap pass-through for balancer reference during charge
+
+**The BMS ESP32 is the sole arbiter** — this is the correct architecture because it already knows SOC, cell voltages, temperature, and current. Charge and OTG decisions are battery-state-aware:
 
 ```
 Adapter plugged in:
-  FUSB302 detects Rp on CC (source) → interrupt → ESP32 reads status
-  ESP32 negotiates PD voltage via FUSB302 → VBUS = 20V (or best available)
-  ESP32 writes BQ25713B charge registers (Ichg, Vchg, input current limit)
+  FUSB302 fires interrupt → BMS ESP32 wakes (ALERT or dedicated IRQ GPIO)
+  BMS ESP32 reads FUSB302: Rp on CC → source attached
+  BMS ESP32 negotiates PD voltage (requests 20V or best available)
+  BMS ESP32 writes BQ25713B: Ichg, Vchg, input current limit
   BQ25713B charges pack
+  BMS ESP32 adjusts Ichg dynamically based on cell temp / SOC state
 
 Phone/device plugged in:
-  FUSB302 detects Rd on CC (sink) → interrupt → ESP32 reads status
-  ESP32 writes BQ25713B OTG enable register + OTG voltage (5V or 9V)
+  FUSB302 fires interrupt → BMS ESP32 wakes
+  BMS ESP32 reads FUSB302: Rd on CC → sink attached
+  BMS ESP32 checks SOC — enforces power limit based on pack state:
+    SOC > 50%: advertise 9V/2.2A (20W)
+    SOC 20–50%: advertise 5V/3A (15W)
+    SOC < 20%: advertise 5V/0.9A (4.5W) — protect pack from deep discharge
+  BMS ESP32 writes BQ25713B OTG voltage + current registers
+  BMS ESP32 sets OTG_CONFIG enable bit
   BQ25713B outputs on VBUS
-  FUSB302 advertises Source_Capabilities if device supports PD
-  Device negotiates → ESP32 responds via FUSB302
+  FUSB302 advertises chosen Source_Capabilities
+  Device negotiates → BMS ESP32 responds via FUSB302
 
 Nothing plugged in:
-  FUSB302 idle, BQ25713B idle, ESP32 sleeping
+  FUSB302 idle, BQ25713B idle, BMS ESP32 returns to deep sleep
 ```
 
-**Role conflict safety:** the ESP32 never enables both charge and OTG simultaneously. OTG enable is a register bit written only after FUSB302 confirms sink role. Charge path enabled only after source role confirmed. The hardware interlock: BQ25713B has an ACOK pin that indicates valid input present — OTG mode is only entered when ACOK is low (no adapter present).
+**SOC-aware OTG** is a key benefit of this architecture: the BMS ESP32 knows exactly how much capacity remains and can throttle or cut OTG output to protect the pack — something the amp ESP32 could never do because it has no direct knowledge of battery state.
+
+**Role conflict safety:** BMS ESP32 never enables charge and OTG simultaneously. OTG enable written only after FUSB302 confirms sink role. Charge enabled only after source role confirmed. Hardware interlock: BQ25713B ACOK pin — OTG only entered when ACOK is low (no adapter present).
+
+**Standalone operation:** the charger board is fully functional with only the BMS board connected — no amp board needed. This makes the BMS node a viable standalone charging solution for any project, completely independent of the speaker or any host application.
 
 ### 4.2 FUSB302 — USB-C PD Physical Layer
 
@@ -422,11 +474,11 @@ The FUSB302 (onsemi, FUSB302B variant) handles all USB-C physical layer operatio
 - CC1/CC2 monitoring — detects Rp (source attached) or Rd (sink attached)
 - DRP toggling — for connecting to other DRP devices (laptops)
 - PD message physical layer (BMC encoding/decoding on CC lines)
-- I2C interface to ESP32 (address 0x22)
-- Interrupt line to ESP32 GPIO — fires on any CC event, attachment, detachment, PD message
+- I2C interface to **BMS ESP32** (address 0x22) — on the same I2C bus as BQ76920 and BQ25713B
+- Interrupt line to **BMS ESP32** GPIO — fires on any CC event, attachment, detachment, PD message — wakes BMS ESP32 from deep sleep
 - VCONN switch control for cable e-marker chips
 
-The ESP32 runs a PD policy engine firmware layer on top — open-source implementations (pd_buddy, fusb302-esp) handle the PD state machine. The FUSB302 handles bits; the firmware handles protocol.
+The BMS ESP32 runs a PD policy engine firmware layer on top — open-source implementations (pd_buddy, fusb302-esp) handle the PD state machine. The FUSB302 handles bits; the BMS firmware handles protocol. All charging and OTG decisions are made by the same firmware that tracks SOC, cell voltages, and temperature — enabling fully battery-aware power management.
 
 **FUSB302 availability:** onsemi part, Mouser/Digikey consistently stocked, ~$1.50.
 
@@ -439,7 +491,7 @@ TI BQ25713B: synchronous NVDC buck-boost battery charge controller, 1–4S, I2C.
 - Automatic buck/boost/buck-boost mode transition without host control — seamless across all input voltages
 - 4× external N-channel FETs — allows FET optimisation for this voltage/current range
 - Single inductor topology
-- I2C (SMBus compatible) — amp ESP32 sets charge current, input current limit, reads VBUS, IBAT, VBAT, fault status
+- I2C (SMBus compatible) — **BMS ESP32** sets charge current, input current limit, reads VBUS, IBAT, VBAT, fault status
 - OTG output: 4.48V–20.8V adjustable, up to 3A from battery — 5V/3A = 15W, 9V/2.2A = 20W
 - Integrated ADC: VBUS, IBAT, VBAT, VSYS all readable over I2C — useful for the BMS webapp display
 - ACOK pin: indicates valid input present — used as hardware interlock for OTG enable
@@ -447,10 +499,12 @@ TI BQ25713B: synchronous NVDC buck-boost battery charge controller, 1–4S, I2C.
 - ~$3.20 at Digikey 100 units, 228 units in stock (verify at order time; TI part with regular restocking)
 - 32-QFN (4×4mm) — ENIG + stencil, same class as other ICs in this design
 
-**External FETs — 4× AO4406 (or equivalent):**
-- 30V Vds, 10A Id, Rds(on) ~10mΩ @ Vgs=4.5V, SO-8
-- At 2.5A charge current: P = 2.5² × 0.04 (all 4 FETs) = 0.25W total — trivial
+**External FETs — 4× AON6354:**
+- 30V Vds, 83A Id, Rds(on) ~5.2mΩ @ Vgs=4.5V, DFN5×6
+- At 2.5A charge current: P_conduction = 2.5² × (4 × 0.0052) = 0.13W total — trivial
+- Switching losses at 800kHz: ~0.4W total across 4 FETs
 - Gate drive from BQ25713B integrated gate drivers — no external driver needed
+- Same part as BMS protection FETs — single AON6354 across entire project BOM
 
 **Single inductor:**
 - Value: 2.2–4.7µH (per BQ25713B datasheet recommendation for 4S)
@@ -460,17 +514,25 @@ TI BQ25713B: synchronous NVDC buck-boost battery charge controller, 1–4S, I2C.
 
 ### 4.4 OTG Operation and Safety
 
-BQ25713B OTG output is explicitly controlled by the ESP32 via I2C register (OTG_CONFIG bits). The safety chain:
+BQ25713B OTG output is explicitly controlled by the **BMS ESP32** via I2C register (OTG_CONFIG bits). The safety chain:
 
 1. FUSB302 fires interrupt — sink device detected on CC
-2. ESP32 reads FUSB302: Rd confirmed, role = source
-3. ESP32 checks BQ25713B ACOK: must be LOW (no adapter present) — if HIGH (adapter present), OTG is blocked
-4. ESP32 writes OTG_VOLTAGE and OTG_CURRENT registers
-5. ESP32 sets OTG_CONFIG enable bit
-6. BQ25713B activates OTG path
-7. FUSB302 advertises 5V/3A (or 9V/2.2A if PD device) on CC
+2. **BMS ESP32** wakes (FUSB302 IRQ pin wired to ESP32 GPIO)
+3. **BMS ESP32** reads FUSB302: Rd confirmed, role = source
+4. **BMS ESP32** checks BQ25713B ACOK: must be LOW (no adapter) — if HIGH, OTG is blocked
+5. **BMS ESP32** reads SOC from BQ76920 — determines OTG power limit:
+   - SOC > 50%: OTG_VOLTAGE = 9V, OTG_CURRENT = 2.2A (20W)
+   - SOC 20–50%: OTG_VOLTAGE = 5V, OTG_CURRENT = 3A (15W)
+   - SOC < 20%: OTG_VOLTAGE = 5V, OTG_CURRENT = 0.9A (4.5W)
+   - SOC < 10%: OTG refused entirely — protect pack from deep discharge
+6. **BMS ESP32** writes OTG_VOLTAGE and OTG_CURRENT registers
+7. **BMS ESP32** sets OTG_CONFIG enable bit
+8. BQ25713B activates OTG path
+9. FUSB302 advertises Source_Capabilities matching the chosen limits
 
-On adapter insertion during OTG: ACOK goes HIGH → ESP32 detects via interrupt → immediately clears OTG enable bit → BQ25713B switches to charge mode. No power contention.
+On adapter insertion during OTG: ACOK goes HIGH → **BMS ESP32** detects via interrupt → immediately clears OTG enable bit → BQ25713B switches to charge mode. No power contention.
+
+**This SOC-aware OTG logic is only possible because the BMS ESP32 owns both the battery monitoring (BQ76920) and the charger control (BQ25713B + FUSB302) on the same I2C bus.** The amp ESP32 has no role in this decision chain.
 
 ### 4.5 Charger Board — Full BOM
 
@@ -493,10 +555,11 @@ On adapter insertion during OTG: ACOK goes HIGH → ESP32 detects via interrupt 
 | D1 | VBUS TVS | SMAJ20A 400W | SMA | 1 | Clamps VBUS transients. Between USB-C VBUS and BQ25713B input. |
 | F1 | Polyfuse | 2.5A hold / ~5A trip | 1812 | 1 | VBUS overcurrent before IC. Self-resetting. |
 | J1 | USB-C receptacle | HRO TYPE-C-31-M-12 or equiv — **16-pin** | SMD mid-mount | 1 | CC1/CC2 to FUSB302. VBUS/GND full copper fill, thermal relief OFF. 4-pin USB-C has no CC lines and cannot do PD. |
-| J2 | Cell tap pass-through | JST-XH 5-pin | THT | 1 | B1/B2/B3 mid-taps from charger side to BMS. |
-| J3 | Power output | XT30U-M | pads | 1 | CHG+/CHG− to BMS J3. |
+| J2 | I2C to BMS ESP32 | JST-SH 4-pin 1.0mm | SMD | 1 | GND / 3.3V / SDA / SCL. Connects FUSB302 + BQ25713B I2C bus to BMS ESP32. Also carries FUSB302 IRQ line to BMS ESP32 GPIO (add 5th pin or route via separate 2-pin JST-SH). |
+| J3 | Cell tap pass-through | JST-XH 5-pin | THT | 1 | B1/B2/B3 mid-taps from charger side to BMS. |
+| J4 | Power output | XT30U-M | pads | 1 | CHG+/CHG− to BMS J3. |
 | LED1 | Charging | Green 0402 | 0402 | 1 | BQ25713B CHRG_OK pin. |
-| LED2 | OTG active | Blue 0402 | 0402 | 1 | Driven by ESP32 GPIO when OTG enabled. |
+| LED2 | OTG active | Blue 0402 | 0402 | 1 | Driven by BMS ESP32 GPIO via I2C cable — or directly from BQ25713B OTG status pin if available. |
 | LED3 | Fault | Red 0402 | 0402 | 1 | BQ25713B FAULT or ACOK status. |
 
 ### 4.6 Charger Layout Rules
@@ -505,7 +568,7 @@ On adapter insertion during OTG: ACOK goes HIGH → ESP32 detects via interrupt 
 
 **Inductor placement:** as close as possible to BQ25713B SW1/SW2 pins. Every mm of trace = parasitic inductance = EMI + efficiency loss. Input caps between USB-C and IC; output caps between IC and output connector.
 
-**FET placement:** 4× AO4407 arranged to minimise switching loop area. Gate resistors close to FET gates. Body diode orientation per BQ25713B reference schematic — verify before routing.
+**FET placement:** 4× AON6354 arranged to minimise switching loop area. Gate resistors close to FET gates. Exposed pads connected to drain copper pours. Body diode orientation per BQ25713B reference schematic — verify before routing.
 
 **FUSB302:** CC1/CC2 traces 0.15mm, direct to IC pins, minimal length. No routing under the IC that could couple into CC lines. VBUS trace wide (≥2mm) from connector to TVS to BQ25713B input.
 
@@ -573,26 +636,52 @@ The AON6354 DFN5×6 exposed bottom pad is the drain connection and the primary t
 ### 7.1 State Machine
 
 ```
-                    DEEP SLEEP (~10µA)
-        ┌──────────────┬──────────────┬──────────────┐
-     RTC timer      ALERT GPIO     UART RX       CAN RX*
-     (60s, NVS-     (BQ76920       (host cmd)    (*node mode)
-     configurable)   fault)
-        │              │              │              │
-        ▼              ▼              ▼              ▼
-   BALANCE CYCLE   FAULT HANDLER  HOST COMMS    CAN HANDLER
-        └──────────────┴──────┬───────┴──────────────┘
+                    DEEP SLEEP (~180µA from B+)
+                    FUSB302 in low-power unattached mode
+                    BQ25713B ADC disabled
+        ┌──────────────┬──────────────┬──────────────┬─────────────┐
+     RTC timer      ALERT GPIO     UART RX       FUSB302 INT   CAN RX*
+     (60s, NVS-     (BQ76920       (host cmd)    (USB-C attach/ (*node mode)
+     configurable)   fault)                       detach event)
+        │              │              │              │              │
+        ▼              ▼              ▼              ▼              ▼
+   BALANCE CYCLE   FAULT HANDLER  HOST COMMS   CHARGER/OTG    CAN HANDLER
+        └──────────────┴──────┬───────┴──────────────┴─────────────┘
                               ▼
             Read BQ76920 (VC1–4, current, temps, faults)
+            Re-enable FUSB302 DRP if woken by FUSB302 INT
+            Read FUSB302 status if IRQ wake (role, PD negotiation)
+            Read/write BQ25713B if charge/OTG state changed
             Update coulomb count + SOC (RTC memory)
             Balance if Δ>30mV (≤30s, LEDC 50kHz, dead-time)
+            Adjust Ichg based on temp/SOC if charging
             Log / respond / broadcast as applicable
-            Update LEDs → return to DEEP SLEEP
+            Update LEDs
+                              ▼
+            PRE-SLEEP SEQUENCE:
+            1. Write FUSB302 CONTROL2 → disable DRP → low-power unattached (~10µA)
+            2. Write BQ25713B → disable continuous ADC → idle (~50µA)
+            3. Configure wake pins (RTC timer, ALERT, UART RX, FUSB302 INT)
+            4. Enter deep sleep
 ```
 
-RTC memory (8KB, survives sleep): SOC accumulator, coulomb count, fault history, cycle count, balance interval setting.
+RTC memory (8KB, survives sleep): SOC accumulator, coulomb count, fault history, cycle count, balance interval setting, last OTG power level, charger state, FUSB302 last known role.
 
-### 7.2 Balancing Algorithm
+### 7.2 Charger and OTG Management
+
+The BMS ESP32 owns the entire charging and OTG decision chain. The FUSB302 IRQ pin is wired to a wake-capable ESP32 GPIO — any USB-C attach or detach event wakes the ESP32 immediately from deep sleep regardless of the balance timer interval.
+
+**I2C bus on BMS ESP32:** BQ76920 (0x08) + FUSB302 (0x22) + BQ25713B (0x6B) all share the same I2C bus. The BMS ESP32 reads cell state and makes charger decisions in the same firmware context — no inter-board communication delay, no data staleness.
+
+**Charge current management:** the BMS ESP32 adjusts Ichg dynamically during the charge cycle:
+- Cell temperature >40°C: derate charge current by 50%
+- Cell temperature >50°C: inhibit charging entirely
+- Any cell group >4.15V: reduce current for top-balance convergence
+- All groups within 10mV: resume full current
+
+**OTG power limits by SOC:** see §4.4 for the full decision table. These thresholds are NVS-configurable.
+
+### 7.3 Balancing Algorithm
 
 Every wake: read 4 voltages → find max/min → if Δ>30mV select transfer path (direct adjacent or chained for non-adjacent) → drive instance(s) for ≤30s via LEDC 50kHz with firmware dead-time → re-read → sleep. Runs identically charging, discharging, or at rest. SOC drift-corrects against OCV table after ≥5min rest.
 
@@ -623,7 +712,8 @@ UART 115200 8N1, ASCII + `\n`. Send `PING` first to wake BMS (~5ms response).
 | `BALANCE_STATE` | `ACTIVE:1-2` / `IDLE` | Current balancer state |
 | `FAULT_STATE` | `NONE` / `OVP:CELL3` | Current fault |
 | `FAULT_LOG` | last 10 timestamped events | — |
-| `STATUS` | `CHARGING/DISCHARGING/IDLE/FAULT` | Pack state |
+| `STATUS` | `CHARGING/DISCHARGING/OTG/IDLE/FAULT` | Pack state including charger mode |
+| `CHARGER_STATUS` | `CHARGING:20V:2.5A` / `OTG:5V:0.9A` / `IDLE` | Current charger/OTG state with voltage and current |
 | `CYCLE_COUNT` | `47` | Charge cycles logged |
 | `SET_BALANCE_INTERVAL:120` | `ACK` | Set interval seconds, NVS-persisted |
 | `VERSION` | `BMS_FW_1.0.0` | Firmware version |
@@ -690,9 +780,9 @@ Post-reflow: probe continuity from QFN center pad thermal via to GND net. No con
 
 1. Stencil paste top side. Inspect aperture fill under magnification.
 2. 0402 passives (caps, resistors, crystal load caps).
-3. ICs: BQ76920 (TSSOP-20), ESP32-S3 (QFN-56), BQ25713B (QFN-32), FUSB302 (QFN-16), TC4427 ×3, Si2302 ×6, AP2112K, AO4406 ×4.
+3. ICs: BQ76920 (TSSOP-20), ESP32-S3 (QFN-56), BQ25713B (QFN-32), FUSB302 (QFN-16), TC4427 ×3, Si2302 ×6, AP63203, AON6354 ×6.
 4. Crystal (3225) — heat-sensitive, place carefully.
-5. SO-8 protection FETs (AO4407A), shunt resistors (2512).
+5. Protection FETs Q1/Q2 (AON6354 DFN5×6), shunt resistors (2512).
 6. Shielded inductors — bulky, place last.
 7. Reflow top side.
 8. Inspect, touch up, IPA clean.
@@ -793,13 +883,14 @@ This project demonstrates: multi-cell Li-ion protection and management · 4-swit
 |---|---|---|
 | Protection IC | BQ76920 | ±1mV accuracy, I2C to ESP32, configurable thresholds, hardware defaults active before/without firmware. Replaces S-8254AA entirely — no redundant sense lines. Mouser/Digikey stocked. |
 | Active balancing | Discrete Si2302 ×6 + TC4427 ×3 + 4.7µH ×3, ESP32 LEDC 50kHz | No sourceable autonomous balancer IC exists. Commodity parts, any-to-any transfer, full firmware control. BQ76920 BALx passive path unused. Runs every 60s wake regardless of charge/discharge state. |
-| BMS LDO | **AP2112K-3.3TRG1** | 600mA, 300mV dropout, SOT-23-5. Low quiescent current — critical for deep sleep power budget. Well stocked. |
+| 3.3V supply | **AP63203 synchronous buck** | Direct B+ input (12–16.8V) → 3.3V. No LDO needed — ESP32-S3 tolerates switching supply; BQ76920 has internal analog LDO. Sourced from B+ so ESP32 stays powered through any protection FET event. ~50µA IQ. Shielded inductor placed away from antenna and VC sense lines. |
 | Shunt | 3mΩ 1% 2W | BQ76920 OCD max register = 56mV. At 8mΩ max trip = 7A (wrong). At 3mΩ: 18.7A trip (correct for this load). |
 | MCU | ESP32-S3 bare SoC + W25Q64 + 40MHz crystal | Full RF layout control, smaller footprint vs module. Requires 4-layer board for antenna keepout and microstrip reference plane. Native USB = flash + JTAG + serial via 4 pads, no bridge IC. |
 | BMS board layers | **4-layer** (revised from 2-layer) | Bare SoC PCB trace antenna needs inner GND plane for microstrip impedance and all-layer keepout void. Module would allow 2-layer; bare SoC does not. |
 | Charger board layers | **4-layer** | BQ25713B + FET switching EMI, CC line integrity beside 5A VBUS, inner GND plane thermal mass. |
 | Charger IC | **BQ25713B** | 3.5–24V input (all PD voltages + legacy chargers), 4S native, I2C, external FETs, OTG 5V/3A or 9V/2.2A, ~$3.20 Digikey 100 units. Sourcing confirmed. |
-| PD negotiation | **FUSB302** (already on hand) | Handles CC detection, DRP toggling, PD BMC. ESP32 runs PD policy engine (open-source pd_buddy/fusb302-esp). Clean separation: FUSB302 handles bits, firmware handles protocol. |
+| Charger comms ownership | **BMS ESP32** | BMS ESP32 owns BQ76920 + FUSB302 + BQ25713B on the same I2C bus. Charging and OTG decisions are battery-state-aware (SOC, temp, cell voltage) in the same firmware context. Amp ESP32 is completely uninvolved — charger board + BMS board is a standalone charging system usable in any project. |
+| SOC-aware OTG | OTG power limit scaled by SOC | >50%: 20W. 20–50%: 15W. <20%: 4.5W. <10%: refused. Possible only because BMS ESP32 owns both measurement and charger control simultaneously. |
 | OTG | Enabled via BQ25713B register | FUSB302 detects sink, ESP32 confirms ACOK=LOW (no adapter), writes OTG register. Hardware interlock prevents simultaneous charge + OTG. Scraps separate USB-A + AP62300 boost — OTG comes free with BQ25713B. |
 | FETs (all positions) | **AON6354 DFN5×6** | 30V, 83A, 5.2mΩ @ Vgs=4.5V. Single part across entire BOM: BMS CHG/DSG + charger 4-switch stage. Exposed drain pad bonds directly to PCB copper pour — better thermal spreading than SO-8. No heatsink needed on either board. |
 | Heatsink | **None required** | AON6354 ultra-low Rds distributes losses trivially. BQ25713B controller dissipates ~0.5W (no switching losses in controller IC). Total charger board dissipation ~1W. No single component stressed. |
