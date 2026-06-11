@@ -3,7 +3,7 @@
 **Scalable Smart BMS Node · USB-C PD Charger Board**  
 Primary application: Bluetooth Speaker / TAS5825M Amplifier Platform  
 Architecture: Distributed modular BMS — single node now, stackable via CAN later  
-*Revision 6.0 · June 2026 · Arik Nel*
+*Revision 6.1 — Pre-Schematic Design Review · June 2026 · Arik Nel*
 
 ---
 
@@ -21,6 +21,8 @@ Architecture: Distributed modular BMS — single node now, stackable via CAN lat
 10. [Test & Verification Procedure](#10-test--verification-procedure)
 11. [System Integration & Multi-Node Scaling](#11-system-integration--multi-node-scaling)
 12. [Key Design Decisions Reference](#12-key-design-decisions-reference)
+13. [Pre-Schematic Design Review — Findings & Required Configuration](#13-pre-schematic-design-review--findings--required-configuration)
+14. [Datasheet Library — Schematic Reference PDFs](#14-datasheet-library--schematic-reference-pdfs)
 
 ---
 
@@ -122,12 +124,12 @@ SOC coulomb counting · configurable threshold adjustment · fault logging with 
 
 The BQ76920 has built-in passive balancing (BALx pins). **This design does not use it.** CELLBAL registers stay 0x00, BALx pins unconnected. The BQ76920's only balancing role is voltage measurement.
 
-True active balancing requires external hardware the BQ76920 cannot drive: complementary FET pairs switching an inductor at 50kHz. The ESP32 drives that hardware directly via LEDC peripheral. The BQ76920 measures; the ESP32 and discrete FETs act.
+True active balancing requires external hardware the BQ76920 cannot drive: complementary FET half-bridges switching an inductor at 15kHz. The ESP32 drives that hardware directly via LEDC + discrete level shifters. The BQ76920 measures; the ESP32 and discrete FETs act.
 
 ```
 1. ESP32 reads VC1–VC4 from BQ76920 over I2C    ← BQ76920's only involvement
 2. ESP32 computes deltas, picks transfer path
-3. ESP32 drives TC4427 → FET gates at 50kHz      ← BQ76920 not involved
+3. ESP32 drives level shifters → FET gates @15kHz ← BQ76920 not involved
 4. Inductor shuttles charge between cell groups
 ```
 
@@ -144,33 +146,43 @@ The balancer connects to cell tap nodes and transfers charge whenever the ESP32 
 
 #### Why no balancer IC
 
-Every autonomous active balancer IC has sourcing problems: ETA3000 (unavailable Mouser/LCSC), LT8584 (custom flyback transformer per cell), LTC3300 (SPI host + coupled inductors). TI's own E2E forum confirms no standalone single-chip active balancer exists. Discrete circuit — Si2302 pairs + TC4427 + standard shielded inductor — uses commodity parts available everywhere. Stronger portfolio piece: circuit is designed, not bought.
+Every autonomous active balancer IC has sourcing problems: ETA3000 (unavailable Mouser/LCSC), LT8584 (custom flyback transformer per cell), LTC3300 (SPI host + coupled inductors). TI's own E2E forum confirms no standalone single-chip active balancer exists. Discrete circuit — Si2301/Si2302 half-bridges + 2N7002/BSS84 level shifters + standard shielded inductors — uses commodity parts available everywhere. Stronger portfolio piece: circuit is designed, not bought.
 
-#### Circuit topology (3 instances: C1↔C2, C2↔C3, C3↔C4)
+#### Circuit topology — corrected for floating gate drive (3 instances: C1↔C2, C2↔C3, C3↔C4)
+
+Each instance is a half-bridge across its two stacked cell groups (nodes BOT / MID / TOP), inductor from the switch node to MID:
 
 ```
-Group N+  ──[Q_H drain]
-               [Q_H source]──[L 4.7µH]──[Q_L source]
-                                              [Q_L drain]──Group N−
-
-Q_H / Q_L gates ← TC4427 dual driver ← ESP32 LEDC PWM
-(complementary signals, firmware-enforced dead-time)
+TOP (upper group +) ──[Si2301 P-ch, source=TOP]──┐
+                                                 SW ──[L 22µH]── MID (junction)
+BOT (lower group −) ──[Si2302 N-ch, source=BOT]──┘
 ```
 
-Q_H on: inductor charges from upper group. Q_L on: inductor discharges into lower group. Reverse pattern = reverse direction. **Any-to-any:** ESP32 runs multiple instances simultaneously in chosen directions for non-adjacent transfers.
+**Why not a ground-referenced gate driver:** only instance A's low-side FET sits at ESP32 ground. Every other gate floats 3.7–16.8V above it — a TC4427-style driver (which also requires a ≥4.5V supply) physically cannot drive them. The correct discrete solution is ground-referenced open-drain level shifters:
+
+- **High-side (Si2301):** gate pulled to TOP via 10kΩ (default off). 2N7002 (source = board GND, gate = ESP32 GPIO_H via 100Ω) pulls the gate down through 1kΩ to turn on. BZT52C6V2 zener TOP→gate clamps |Vgs| ≤ 6.2V.
+- **Low-side (Si2302):** gate pulled to BOT via 10kΩ (default off). BSS84 (source = MID) pulls the gate up to MID (+3.7V Vgs) to turn on. The BSS84's own gate is pulled to MID via 10kΩ and pulled down by a second 2N7002 (source = GND, gate = ESP32 GPIO_L) through 1kΩ, with a BZT52C6V2 zener MID→BSS84 gate.
+- **Switching frequency: 15kHz** (LEDC). Resistor-pullup level shifters are too slow for 50kHz; at 15kHz the 10kΩ/Ciss time constants comfortably fit the 66µs period with firmware dead-time ≥2µs.
+- **Inductor: 22µH, Isat ≥3A, shielded** — sized for ~2.8A pk-pk ripple at 15kHz → ~1A average balance current.
+- Net transfer direction set by duty cycle around 50%; ESP32 runs instances simultaneously for non-adjacent (chained) transfers.
+
+Per-instance parts: Si2301 ×1, Si2302 ×1, 2N7002 ×2, BSS84 ×1, BZT52C6V2 ×2, 10kΩ ×3, 1kΩ ×2, 100Ω ×2, 22µH ×1, 100nF ×1. At ~1A, a 100mAh imbalance resolves in ~6 minutes of cumulative balancing — entirely adequate at a 60s wake interval.
 
 ### 2.4 ESP32-S3 Integration — Bare SoC Design
 
-Bare ESP32-S3 SoC (QFN-56), 8MB NOR flash (W25Q64JVSSIQ, WSON-8), 40MHz crystal, PCB trace antenna. Full RF layout responsibility on the PCB — the main reason the BMS board is 4-layer (see §5).
+Bare ESP32-S3 SoC (QFN-56), 8MB NOR flash (W25Q64JV, SOIC-8 or WSON-8), 40MHz crystal, 1206 ceramic chip antenna. Full RF layout responsibility on the PCB.
 
 #### Core subsystem components
 
 | Ref | Component | Value / Part | Notes |
 |---|---|---|---|
 | U2 | ESP32-S3 SoC | QFN-56 | Native USB, TWAI, LEDC, WiFi/BT. No module — full RF control. |
-| U_FL | NOR Flash | W25Q64JVSSIQ 8MB WSON-8 | QSPI to FSPI pins. 100nF + 1µF at VCC. |
+| U_FL | NOR Flash | W25Q64JVSSIQ (SOIC-8) or W25Q64JVZPIQ (WSON-8) | QSPI to FSPI pins. 100nF + 1µF at VCC. Suffix sets package — SSIQ = SOIC-8, ZPIQ = WSON-8. |
 | X1 | Crystal | 40MHz ±10ppm, 3225 | Epson FA-238 or equiv. Load caps per CL spec — typically 2×15pF at CL=10pF. |
-| U3 | 3.3V Buck | **AP63203** (Diodes Inc.) | SOT-23-6. 3.8–32V input, 3.3V fixed output, 3A. Sourced from B+ — powers ESP32-S3 + BQ76920 + FUSB302 + BQ25713B logic regardless of protection FET state. ~50µA IQ. |
+| U3 | 3.3V Buck | **AP63203** (Diodes Inc.) | TSOT-26. 3.8–32V input, 3.3V fixed output, **2A**. Sourced from B+ — powers all logic regardless of protection FET state. ~22µA IQ. 2A covers worst case (WiFi TX ~350mA + all logic <600mA total). |
+| ANT1 | Chip antenna | Johanson 2450AT18A100E or 2450AT18B100E | 1206, 2.4GHz. Board edge placement, radiating end outward. Top-layer clearance only — no inner layer keepout. ~€0.30. |
+| L_RFC | RF matching — series | 0Ω placeholder or tuned value | Series element of π-match on LNA_IN. Use Espressif chip antenna reference values (different from trace antenna table). |
+| C_RFC1, C_RFC2 | RF matching — shunt | Per Espressif chip antenna ref schematic | Shunt caps in π-match. Typically 1–2pF. |
 
 #### Crystal layout rules
 
@@ -186,14 +198,30 @@ Bare ESP32-S3 SoC (QFN-56), 8MB NOR flash (W25Q64JVSSIQ, WSON-8), 40MHz crystal,
 - 100nF directly at flash VCC pin + 1µF on same node
 - Route on inner layer if top layer is congested near SoC
 
-#### PCB trace antenna — highest-priority placement rule
+#### 1206 Chip Antenna — replaces PCB trace antenna
 
-The antenna is a tuned 50Ω microstrip. **No copper on any layer** (top, inner planes, bottom) within the keepout zone — inner plane void must be explicitly designed in KiCad and verified in gerbers before ordering.
+A 1206 ceramic chip antenna replaces the PCB trace antenna. This is the correct choice for an ESP32-S3 inside a speaker enclosure:
 
-- Antenna at board corner or edge, facing outward
-- All switching sources (balancer FETs, power polygon, XT30 connectors) on **opposite end of board** — maximum physical separation
-- Antenna trace width from JLC7628 stackup: layer 1→layer 2 prepreg ~0.21mm, εr ~4.6 → **~0.38–0.42mm for 50Ω** — calculate with KiCad microstrip tool or Saturn PCB Toolkit using actual JLC values before routing
-- RF matching network (π-match) on LNA_IN: use Espressif hardware design guide reference values as starting point
+- **No all-layer keepout void** — inner GND plane (layer 2) runs continuously everywhere except a small pad clearance under the antenna element itself. This eliminates the most complex layout constraint of the trace antenna approach.
+- **Top-layer clearance only** — ~3mm in front of the antenna tip, ~1mm either side, on the top copper layer only. No inner layer or bottom layer restriction.
+- **Better enclosure performance** — ceramic element is less sensitive to nearby copper pours and battery cells than a trace antenna. Penetrates wood/MDF/plastic speaker enclosures easily at 5–10m range.
+- **Hand-solderable** — 1206 package is comfortable with a standard iron. No reflow required if preferred.
+
+**Recommended part:** Johanson Technology 2450AT18A100E or 2450AT18B100E (1206, 2.4GHz — both Johanson parts, interchangeable footprint; referenced in Espressif antenna design guides). Both Mouser/Digikey stocked, ~€0.30.
+
+**Placement:**
+- At board edge, antenna element flush with or slightly overhanging the edge — radiating end faces outward into free space
+- All high-current components (FETs, balancer inductors, power polygons) on the opposite end of the board
+- BQ76920 VC sense lines maintain ≥3mm clearance from antenna element
+
+**Matching network (π-match on LNA_IN):**
+Same as trace antenna — two shunt components + one series component between LNA_IN and antenna feed. Use Espressif's ESP32-S3 hardware design guide reference values for the chip antenna variant (separate table from trace antenna values — verify the correct section). 0Ω placeholder on the series element for tuning if needed.
+
+**What this removes from the design vs trace antenna:**
+- All-layer copper keepout void on BMS board (was the most complex gerber requirement)
+- Inner GND plane void specification in JLCPCB fab notes
+- Microstrip width calculation and trace routing
+- Antenna keepout DRC rule in KiCad
 
 #### ESP32-S3 power domains (all require independent decoupling)
 
@@ -266,7 +294,7 @@ Route D+/D− as matched-length differential pair, no vias.
 
 ### 2.6 Host UART Port
 
-4-pin JST-SH 1.0mm (GND / 3.3V / TX / RX). 115200 8N1, ASCII protocol (§8). Amp board ESP32 connects here. Doubles as dev serial monitor with CP2102 dongle. UART RX wakes BMS from sleep in ~5ms.
+4-pin JST-SH 1.0mm (GND / 3.3V / TX / RX). 115200 8N1, ASCII protocol (§8). Amp board ESP32 connects here. Doubles as dev serial monitor with CP2102 dongle. **Wake mechanics:** the ESP32-S3 cannot wake from deep sleep on UART data — only light sleep supports UART wake. Instead the RX pin (an RTC-capable GPIO 0–21) is configured as an EXT wake source on falling edge: the start bit of the host's `PING` wakes the chip (that byte is lost; full reboot with RTC RAM intact, ~150–300ms). The host library sends `PING`, waits up to 500ms, retries ×3.
 
 ### 2.7 BMS Node Board — Full BOM
 
@@ -276,22 +304,23 @@ Route D+/D− as matched-length differential pair, no vias.
 |---|---|---|---|---|---|
 | U1 | AFE / protection | TI BQ76920 | TSSOP-20 | 1 | ±1mV cell groups, I2C 0x08, OVP/UVP/OCD/SCD/OCC, CHG+DSG FET drive, ALERT. Mouser/Digikey stocked. |
 | U2 | MCU | ESP32-S3 bare SoC | QFN-56 | 1 | Native USB, TWAI, LEDC, WiFi. Bare SoC — see §2.4 for full subsystem. |
-| U3 | 3.3V Buck | AP63203 (Diodes Inc.) | SOT-23-6 | 1 | 3.8–32V input, 3.3V fixed output, 3A, synchronous buck. Sourced from B+ — ESP32 stays powered regardless of protection FET state. ~50µA IQ at light load — negligible sleep impact. Add 10µF input + 22µF output caps + shielded inductor per datasheet. |
-| U_FL | NOR Flash | W25Q64JVSSIQ 8MB | WSON-8 | 1 | QSPI interface. 100nF + 1µF at VCC. |
+| U3 | 3.3V Buck | AP63203 (Diodes Inc.) | TSOT-26 | 1 | 3.8–32V input, 3.3V fixed output, **2A**, synchronous buck. Sourced from B+ — ESP32 stays powered regardless of protection FET state. ~50µA IQ at light load — negligible sleep impact. Add 10µF input + 22µF output caps + shielded inductor per datasheet. |
+| U_FL | NOR Flash | W25Q64JVSSIQ 8MB | SOIC-8 | 1 | QSPI interface. 100nF + 1µF at VCC. (WSON-8 variant = W25Q64JVZPIQ.) |
 | X1 | Crystal | 40MHz ±10ppm | 3225 | 1 | E.g. Epson FA-238. 2× load caps per CL spec. |
 | Q1 | CHG FET | AON6354 30V 83A 5.2mΩ | DFN5×6 | 1 | Back-to-back on B− rail. Driven by BQ76920 CHG pin. Exposed pad → PCB copper pour for thermal spreading. |
 | Q2 | DSG FET | AON6354 30V 83A 5.2mΩ | DFN5×6 | 1 | Driven by BQ76920 DSG pin. Body diode orientation critical — verify against BQ76920 ref schematic. |
-| Q3 | Pre-discharge FET | 2N7002 | SOT-23 | 1 | Optional. Soft-starts PVDD caps via R2 — prevents inrush SCD trip. |
-| Q_HA/Q_LA | Balancer FETs — inst. A | Si2302 20V 2A ×2 | SOT-23 | 2 | C1↔C2 instance. Low Vgs threshold, TC4427-driven. |
-| Q_HB/Q_LB | Balancer FETs — inst. B | Si2302 20V 2A ×2 | SOT-23 | 2 | C2↔C3 instance. |
-| Q_HC/Q_LC | Balancer FETs — inst. C | Si2302 20V 2A ×2 | SOT-23 | 2 | C3↔C4 instance. |
-| DRV_A–C | Gate drivers | TC4427 dual ×3 | SOT-23-5 | 3 | One per balancer instance. 3.3V input compatible. Buffers ESP32 GPIO. |
-| L_A–C | Balancer inductors | 4.7µH Isat ≥3A **shielded** ×3 | 4×4mm | 3 | **Shielded mandatory** — 50kHz unshielded core couples into BQ76920 VC lines. |
+| Q3 | Pre-charge FET | Si2302 20V 2A | SOT-23 | 1 | Soft-starts amplifier PVDD bulk caps via R2 for ~200–300ms before Q2 closes — prevents inrush SCD trip. (2N7002 at 300mA was undersized for the 0.76A peak.) |
+| Q_HA–C | Balancer high-side FETs | Si2301 P-ch 20V ×3 | SOT-23 | 3 | One per instance, source at TOP node. Gate via 10k pull-up + 2N7002 level shifter + 6.2V zener clamp. |
+| Q_LA–C | Balancer low-side FETs | Si2302 N-ch 20V ×3 | SOT-23 | 3 | One per instance, source at BOT node. Gate driven to MID via BSS84 + level shifter. |
+| Q_LS1–6 | Level shifters (pull-down) | 2N7002 ×6 | SOT-23 | 6 | Ground-referenced open-drain shifters: 2 per instance (one per power FET gate path). |
+| Q_LS7–9 | Level shifters (pull-up) | BSS84 P-ch ×3 | SOT-23 | 3 | One per instance: pulls low-side N gate up to MID node. |
+| D_Z1–6 | Gate zener clamps | BZT52C6V2 6.2V ×6 | SOD-123 | 6 | Two per instance — clamp Vgs of Si2301 and BSS84 within rating. |
+| L_A–C | Balancer inductors | **22µH** Isat ≥3A **shielded** ×3 | 5×5mm | 3 | Sized for 15kHz: ~2.8A pk-pk ripple, ~1A avg transfer. Shielded mandatory — couples into VC lines otherwise. |
 | R1 | Pack shunt | **3mΩ ±1% 2W** | 2512 | 1 | Kelvin to BQ76920 SRP/SRN. 56mV OCD max / 3mΩ = 18.7A trip. |
-| R2 | Pre-discharge | 10Ω 1W | 2512 | 1 | With Q3. |
+| R2 | Pre-charge resistor | 22Ω 1W | 2512 | 1 | With Q3. Peak inrush 16.8V/22Ω = 0.76A. |
 | R3, R4 | FET gate R | 1kΩ ×2 | 0402 | 2 | Q1/Q2 main protection FET gate damping. |
 | R5 | Q3 pull-down | 100kΩ | 0402 | 1 | Holds Q3 off when control line floating. |
-| R6–R9 | VC filter R | 100Ω ×4 | 0402 | 4 | With C6–C9: ~16kHz LPF per VC line. Rejects 50kHz balancer noise. |
+| R6–R9 | VC filter R | 100Ω ×4 | 0402 | 4 | With C6–C9: ~16kHz LPF per VC line. Rejects 15kHz balancer noise and harmonics. |
 | R10–R15 | Balancer gate R | 10Ω ×6 | 0402 | 6 | Switching edge damping per FET gate. |
 | R16, R17 | I2C pull-ups | 4.7kΩ ×2 | 0402 | 2 | SDA/SCL to 3.3V, near BQ76920. |
 | R18, R19 | BQ76920 REGSRC divider | Per datasheet Table 1 | 0402 | 2 | Sets BQ76920 internal LDO input from pack voltage. |
@@ -299,7 +328,7 @@ Route D+/D− as matched-length differential pair, no vias.
 | C3 | BQ76920 REGSRC | 10µF X7R | 0805 | 1 | Within 1mm of pin. |
 | C4, C5 | BQ76920 decoupling | 100nF + 10nF | 0402 | 2 | VCC and DVDD pins. |
 | C6–C9 | VC filter C | 0.1µF ×4 | 0402 | 4 | At VC pins to GND. With R6–R9: cutoff ~16kHz. |
-| C10–C12 | Balancer bootstrap | 100nF ×3 | 0402 | 3 | One per balancer instance. |
+| C10–C12 | Balancer local decoupling | 100nF ×3 | 0402 | 3 | One per instance, across TOP–BOT near the half-bridge. |
 | C13–C22 | ESP32-S3 decoupling | 10µF + 100nF per VDD domain | 0402/0805 | 10 | Five VDD domains: VDD3P3, VDD3P3_RTC, VDD3P3_CPU, VDD_SDIO, VDD3P3_USB. Within 0.5mm each. |
 | C23 | Buck input cap | 10µF 25V X7R | 0805 | 1 | AP63203 VIN decoupling. Place within 1mm of VIN pin. |
 | C24 | Buck output cap | 22µF 10V X7R | 0805 | 1 | AP63203 output. Per datasheet recommendation for 3.3V output stability. |
@@ -307,7 +336,7 @@ Route D+/D− as matched-length differential pair, no vias.
 | C_X1, C_X2 | Crystal load caps | ~15pF (verify per CL) | 0402 | 2 | Symmetric placement at crystal pads. |
 | NTC1 | Cell NTC | 100kΩ B=3950 | leaded | 1 | Epoxied to cell body → BQ76920 TS1. |
 | NTC2 | FET NTC | 100kΩ B=3950 | 0402 | 1 | Near Q1/Q2 → BQ76920 TS2. |
-| D1 | Reverse polarity | SS34 40V 3A | SMA | 1 | On B+ input from battery. |
+| R_RS, D_RS | BQ76920 REGSRC protection | 1kΩ + 5.1V zener | 0402/SOD-123 | 2 | Series R + zener on REGSRC supply line per BQ76920 datasheet. (Series Schottky on the main B+ path deleted — a 3A diode on a 12A path would burn and waste ~5W; reverse protection is provided by the keyed JST-XH cell connector.) |
 | J1 | Cell taps | JST-XH 5-pin | THT | 1 | B−, B1, B2, B3, B+. Keyed. |
 | J2 | Load output | XT30U-F right-angle | pads | 1 | P+/P− to amp PVDD. |
 | J3 | Charger input | XT30U-F | pads | 1 | CHG+/CHG− from charger board. |
@@ -320,9 +349,9 @@ Route D+/D− as matched-length differential pair, no vias.
 
 | Ref | Component | Part / Value | Package | Qty | Notes |
 |---|---|---|---|---|---|
-| U4 | Isolated CAN transceiver | TI ISO1050DUB | SOP-8 wide | 1 | Single chip: isolation + CAN transceiver. Logic side 3.3V (ESP32 TWAI), bus side 5V. |
-| U5 | Isolated DC-DC | B0305S-1W (3.3V→5V, Mornsun) | SIP-4 | 1 | Powers ISO1050 bus side. Galvanic barrier between node logic and CAN bus ground. |
-| C_CAN | Isolation decoupling | 10µF + 100nF ×2 sides | 0402/0805 | 4 | Per ISO1050 + B0305S datasheets. |
+| U4 | Isolated CAN transceiver | TI **ISO1042BD** | SOIC-8/16 | 1 | Single chip: isolation + CAN transceiver. VIO logic side 1.71–5.5V (true 3.3V TWAI compatibility — the ISO1050 requires 4.5–5.5V on its logic side and was replaced for this reason). Bus side 5V from B0305S. |
+| U5 | Isolated DC-DC | B0305S-1W (3.3V→5V, Mornsun) | SIP-4 | 1 | Powers ISO1042 bus side. Galvanic barrier between node logic and CAN bus ground. |
+| C_CAN | Isolation decoupling | 10µF + 100nF ×2 sides | 0402/0805 | 4 | Per ISO1042 + B0305S datasheets. |
 | R_TERM | CAN termination | 120Ω | 0805 | 1 | With solder jumper SJ1 — closed only on the two physical end nodes of the bus. |
 | SJ1 | Termination jumper | 2-pad solder jumper | — | 1 | — |
 | SW1 | Node address | 4-pos DIP switch | SMD | 1 | 16 node IDs, read by ESP32 at boot → CAN ID. |
@@ -361,19 +390,23 @@ At 3mΩ nominal: 0.5mΩ trace error = 17% OCP threshold shift. Not a refinement 
 
 **VC sense lines:** JST tap → 100Ω → VC pin, 0.1µF to GND at pin. Minimum 3mm from any balancer inductor. Cross power polygon only perpendicular, opposite layer.
 
-**Balancer placement:** each instance adjacent to its two cell-tap nodes. Inductor between FET pair SW node and taps — minimal loop area. TC4427 near gates, not near ESP32. Shielded inductors only.
+**Balancer placement:** each instance adjacent to its two cell-tap nodes. Inductor between half-bridge SW node and MID tap — minimal loop area. Level-shifter transistors near the gates they drive, not near the ESP32. Shielded inductors only.
 
-**PCB trace antenna — first-priority placement:**
-- Antenna at board corner or edge facing outward
-- Keepout void on ALL layers including inner plane — specify explicitly in KiCad, verify in gerber viewer
-- All switching sources on opposite end of board
-- Antenna trace width ~0.38–0.42mm (verify from actual JLC7628 stackup with calculator)
+**1206 chip antenna — placement:**
+- Board edge, element overhanging or flush, radiating end outward
+- Top layer only: ~3mm clearance in front, ~1mm sides — no copper/traces/vias in this zone on top layer only
+- **Inner layers and bottom: no keepout** — layer 2 GND plane continues normally right up to the antenna pad boundary
+- All switching sources (FETs, balancer inductors, power polygon) on the opposite end of the board from the antenna
+- VC sense lines ≥3mm from antenna element
+- π-match directly at LNA_IN — use Espressif chip antenna reference values (distinct table from trace antenna in the hardware design guide)
+
+**AON6354 DFN5×6 thermal vias:** minimum **3×3 grid (9 vias)**, 0.3mm drill, 1.0mm pitch under each exposed drain pad. Tented on top side (solder mask over via entry — prevents paste from wicking into via during stencil print), open on bottom side (allows solder to partially fill via during reflow, improving thermal conductivity). Connect via landings to a solid 2oz copper pour minimum 8×8mm around each device on the bottom layer, stitched to the inner GND plane.
 
 **Crystal:** guard ring stitched to layer 2 every 1mm. No switching traces within 3mm. XTAL_P/N traces ≤5mm, no vias.
 
-**CAN isolation gap:** no copper crosses the ISO1050/B0305S barrier on any layer. ≥4mm creepage. Bus-side ground pour is an isolated island fed only by B0305S output.
+**CAN isolation gap:** no copper crosses the ISO1042/B0305S barrier on any layer. ≥4mm creepage. Bus-side ground pour is an isolated island fed only by B0305S output.
 
-**Ground plane:** continuous layer 2 (inner GND plane), no split — except antenna keepout void and CAN isolation island. BQ76920 AGND and DGND both to same plane per datasheet.
+**Ground plane:** continuous layer 2 (inner GND plane), no split — except CAN isolation island. BQ76920 AGND and DGND both to same plane per datasheet. With chip antenna there is no inner layer keepout void — layer 2 is fully continuous.
 
 **USB D+/D−:** matched-length differential pair to J5 pads, no vias.
 
@@ -396,7 +429,7 @@ Each node treats its own 4S bank as its entire universe. Series current is commo
 
 ### 3.2 Why Galvanic Isolation Is Non-Negotiable
 
-Node 2's battery ground sits 14.8V above Node 1's; Node 4's sits ~44V above Node 1's. Shared CAN ground without isolation = dead short through the communication wiring. The ISO1050 + B0305S create a floating data network spanning the full stack potential — the master sees only data packets, never pack voltages.
+Node 2's battery ground sits 14.8V above Node 1's; Node 4's sits ~44V above Node 1's. Shared CAN ground without isolation = dead short through the communication wiring. The ISO1042 + B0305S create a floating data network spanning the full stack potential — the master sees only data packets, never pack voltages.
 
 **Single-node speaker build:** leave U4, U5, optos, DIP, J7/J8 unpopulated. Footprints cost zero.
 
@@ -545,17 +578,18 @@ On adapter insertion during OTG: ACOK goes HIGH → **BMS ESP32** detects via in
 | C1, C2 | VBUS bulk | 22µF 25V X7R ×2 | 1210 | 2 | Input rail. Two in parallel for low ESR. 25V rated for 20V PD margin. |
 | C3, C4 | Battery output bulk | 47µF 25V X7R ×2 | 1210 | 2 | Battery output. Charge ripple reduction. |
 | C5–C10 | IC decoupling | 100nF ×6 + 10nF ×2 | 0402 | 8 | Per supply pin, within 0.5mm. |
-| C11 | Bootstrap cap | 100nF X7R | 0402 | 1 | Per BQ25713B datasheet bootstrap requirements. |
+| C11, C11b | Bootstrap caps BTST1/BTST2 | 100nF X7R ×2 | 0402 | 2 | One per high-side gate driver — the 4-switch stage has two high-side FETs, both need bootstrap. |
 | C12, C13 | FUSB302 decoupling | 100nF + 1µF | 0402/0805 | 2 | VDD and VCONN supply pins. |
 | R_ISET | Charge current | Per BQ25713B Table — or I2C only | 0402 | 1 | Optional: sets minimum charge current floor. Primary current set via I2C. |
-| R_SNS | Charge current shunt | 10mΩ ±1% 1W | 2512 | 1 | BQ25713B IADPT/IBAT sensing. Kelvin connections. |
+| R_AC | Input current sense | 10mΩ ±1% 1W | 2512 | 1 | Between ACP/ACN — adapter/input current sensing. Kelvin connections. **The BQ25713 requires two sense resistors.** |
+| R_SR | Charge current sense | 10mΩ ±1% 1W | 2512 | 1 | Between SRP/SRN — battery/charge current sensing. Kelvin connections. |
 | R1, R2 | I2C pull-ups | 4.7kΩ ×2 | 0402 | 2 | SDA/SCL for shared I2C bus (FUSB302 + BQ25713B). |
 | R3 | FUSB302 VCONN R | 1kΩ | 0402 | 1 | VCONN current limit per FUSB302 application circuit. |
-| NTC1 | Battery NTC | 100kΩ B=3950 | 0402 | 1 | BQ25713B TS pin. Charge derating above 40°C, inhibit above 50°C. |
+| — | ~~Battery NTC~~ | — | — | 0 | Removed: the BQ25713 has no TS/NTC input pin. Temperature-based charge derating is done in firmware — the BMS ESP32 reads the cell NTCs via BQ76920 and writes reduced Ichg over I2C (§7.2). |
 | D1 | VBUS TVS | SMAJ20A 400W | SMA | 1 | Clamps VBUS transients. Between USB-C VBUS and BQ25713B input. |
 | F1 | Polyfuse | 2.5A hold / ~5A trip | 1812 | 1 | VBUS overcurrent before IC. Self-resetting. |
 | J1 | USB-C receptacle | HRO TYPE-C-31-M-12 or equiv — **16-pin** | SMD mid-mount | 1 | CC1/CC2 to FUSB302. VBUS/GND full copper fill, thermal relief OFF. 4-pin USB-C has no CC lines and cannot do PD. |
-| J2 | I2C to BMS ESP32 | JST-SH 4-pin 1.0mm | SMD | 1 | GND / 3.3V / SDA / SCL. Connects FUSB302 + BQ25713B I2C bus to BMS ESP32. Also carries FUSB302 IRQ line to BMS ESP32 GPIO (add 5th pin or route via separate 2-pin JST-SH). |
+| J2 | I2C + INT to BMS ESP32 | JST-SH **5-pin** 1.0mm | SMD | 1 | GND / 3.3V / SDA / SCL / INT. I2C bus (FUSB302 0x22 + BQ25713B 0x6B) plus FUSB302 INT line to a BMS ESP32 RTC-capable GPIO. Pull-ups live on the BMS board only — one set per bus. |
 | J3 | Cell tap pass-through | JST-XH 5-pin | THT | 1 | B1/B2/B3 mid-taps from charger side to BMS. |
 | J4 | Power output | XT30U-M | pads | 1 | CHG+/CHG− to BMS J3. |
 | LED1 | Charging | Green 0402 | 0402 | 1 | BQ25713B CHRG_OK pin. |
@@ -574,7 +608,7 @@ On adapter insertion during OTG: ACOK goes HIGH → **BMS ESP32** detects via in
 
 **USB-C connector:** VBUS/GND pads — solid copper fill, thermal relief OFF (5A through these pads). CC1/CC2 — 0.15mm signal traces.
 
-**R_SNS Kelvin:** same rule as BMS R1 — sense taps directly at resistor end pads, dedicated 0.15mm traces to BQ25713B IADPT+/IADPT− pins.
+**R_AC / R_SR Kelvin:** same rule as BMS R1 — sense taps directly at each resistor's end pads, dedicated 0.15mm traces to the BQ25713B ACP/ACN and SRP/SRN pins respectively.
 
 ---
 
@@ -584,12 +618,10 @@ Both boards are 4-layer. Same JLCPCB process, same stackup (JLC7628, 1.6mm), one
 
 | Board | Layers | Copper | Reasoning |
 |---|---|---|---|
-| BMS node | **4** | 2oz outer / 1oz inner | Bare ESP32-S3 SoC PCB trace antenna requires solid inner GND plane (layer 2) for microstrip impedance reference. Antenna keepout void must clear ALL layers including inner planes — impossible to implement correctly on 2-layer. 50kHz balancer FETs beside ±1mV sense lines benefit from plane separation. SoC QFN-56 thermal via stack. Crystal guard ring. Module's internal ground plane and shield can would handle this; bare SoC on 2-layer does not. |
+| BMS node | **4** | 2oz outer / 1oz inner | Bare ESP32-S3 SoC requires solid inner GND plane (layer 2) as reference plane for chip antenna π-match and crystal guard ring via stitching. 15kHz balancer half-bridges beside ±1mV BQ76920 sense lines benefit from plane separation and clean return current paths. SoC QFN-56 thermal via stack to inner plane. With chip antenna the inner plane is fully continuous (no keepout void) — simpler than trace antenna while retaining all thermal and signal integrity benefits. |
 | Charger | **4** | 2oz outer / 1oz inner | BQ25713B QFN at 2–4W needs inner GND plane (drops θJA ~30–40%); 800kHz 4-switch switching nodes need reference plane 0.2mm below; FUSB302 CC lines beside 5A VBUS benefit from shielding. Without 4-layer, high-power OTG pushes toward thermal derating. |
 
 **Stackup:** Signal top (2oz) / GND plane (1oz) / Power or signal (1oz) / Signal bottom (2oz). JLC7628 standard prepreg.
-
-> **Antenna keepout on BMS board:** inner GND plane (layer 2) must have copper void matching the top-layer antenna keepout boundary. Specify this void in KiCad inner layer and verify in 3D viewer + DRC before ordering. If this void is missing, the antenna microstrip impedance is undefined and RF performance is unpredictable.
 
 ---
 
@@ -607,7 +639,7 @@ No heatsink required on either board. All components operate well within safe te
 | BQ76920 | ~0.05W (µA quiescent) | TSSOP-20 | negligible | ~27°C ✅ |
 | ESP32-S3 | ~0.26W average active | QFN-56, copper pour | ~15°C | ~40°C ✅ |
 
-Total board dissipation: ~2.3W maximum. No single component stressed. DFN5×6 exposed pad is critical — it must be soldered to a solid copper pour (not just the DFN land pattern). Add thermal vias under the exposed pad to the inner ground plane for maximum spreading.
+Total board dissipation: ~2.3W maximum. No single component stressed. DFN5×6 exposed pad is critical — it must be soldered to a solid copper pour (not just the DFN land pattern). Add a **minimum 3×3 grid (9 vias)**, 0.3mm drill, 1.0mm pitch under each exposed pad, tented top side / open bottom side, connecting to the inner GND plane. Minimum 8×8mm 2oz copper pour around each device on the bottom layer.
 
 ### 6.2 Charger Board — Full Thermal Analysis
 
@@ -653,7 +685,7 @@ The AON6354 DFN5×6 exposed bottom pad is the drain connection and the primary t
             Read FUSB302 status if IRQ wake (role, PD negotiation)
             Read/write BQ25713B if charge/OTG state changed
             Update coulomb count + SOC (RTC memory)
-            Balance if Δ>30mV (≤30s, LEDC 50kHz, dead-time)
+            Balance if Δ>30mV (≤30s, LEDC 15kHz, dead-time)
             Adjust Ichg based on temp/SOC if charging
             Log / respond / broadcast as applicable
             Update LEDs
@@ -683,7 +715,7 @@ The BMS ESP32 owns the entire charging and OTG decision chain. The FUSB302 IRQ p
 
 ### 7.3 Balancing Algorithm
 
-Every wake: read 4 voltages → find max/min → if Δ>30mV select transfer path (direct adjacent or chained for non-adjacent) → drive instance(s) for ≤30s via LEDC 50kHz with firmware dead-time → re-read → sleep. Runs identically charging, discharging, or at rest. SOC drift-corrects against OCV table after ≥5min rest.
+Every wake: read 4 voltages → find max/min → if Δ>30mV select transfer path (direct adjacent or chained for non-adjacent) → drive instance(s) for ≤30s via LEDC 15kHz with firmware dead-time → re-read → sleep. Runs identically charging, discharging, or at rest. SOC drift-corrects against OCV table after ≥5min rest.
 
 ### 7.3 WiFi Webapp Mode
 
@@ -691,7 +723,7 @@ No UART host for >60s after boot → join configured WiFi (NVS) or AP mode `BMS_
 
 ### 7.4 Node Mode (CAN populated)
 
-DIP-read node ID at boot → periodic CAN frames (voltages, SOC, current, temp, status) → obeys master commands → asserts/reacts to hardware FAULT line independent of CAN bus health. TWAI peripheral + ISO1050, wake-on-CAN via RX GPIO edge.
+DIP-read node ID at boot → periodic CAN frames (voltages, SOC, current, temp, status) → obeys master commands → asserts/reacts to hardware FAULT line independent of CAN bus health. TWAI peripheral + ISO1042, wake-on-CAN via RX GPIO edge.
 
 ---
 
@@ -701,7 +733,7 @@ UART 115200 8N1, ASCII + `\n`. Send `PING` first to wake BMS (~5ms response).
 
 | Command | Response | Description |
 |---|---|---|
-| `PING` | `PONG` | Wake + connectivity check |
+| `PING` | `PONG` | Wake + connectivity check. First `PING` after sleep wakes the BMS (its start bit is the wake edge and is consumed); reply arrives ~150–300ms later. Library retries automatically. |
 | `PACK_VOLTAGE` | `14823` | Total pack voltage in mV |
 | `PACK_CURRENT` | `-2340` | mA, negative = discharging |
 | `PACK_SOC` | `73` | State of charge % |
@@ -754,7 +786,7 @@ Library handles wake-on-PING, timeout/retry, response parsing, and unsolicited m
 |---|---|---|
 | Layers / copper | **4 / 2oz outer, 1oz inner** | **4 / 2oz outer, 1oz inner** |
 | Surface finish | ENIG | ENIG |
-| Via tenting | Open (inner plane antenna keepout void in gerbers) | Tented bottom under BQ25713B (fab note) |
+| Via tenting | Open (no inner plane antenna keepout void required — chip antenna, top-layer clearance only) | Tented bottom under BQ25713B (fab note) |
 | Stencil | Frameless, yes | Frameless, yes |
 | Thickness | 1.6mm | 1.6mm |
 | Silkscreen | Both sides | Both sides |
@@ -780,7 +812,7 @@ Post-reflow: probe continuity from QFN center pad thermal via to GND net. No con
 
 1. Stencil paste top side. Inspect aperture fill under magnification.
 2. 0402 passives (caps, resistors, crystal load caps).
-3. ICs: BQ76920 (TSSOP-20), ESP32-S3 (QFN-56), BQ25713B (QFN-32), FUSB302 (QFN-16), TC4427 ×3, Si2302 ×6, AP63203, AON6354 ×6.
+3. ICs: BQ76920 (TSSOP-20), ESP32-S3 (QFN-56), BQ25713B (QFN-32), FUSB302 (QFN-16), Si2301 ×3, Si2302 ×4 (3 balancer + Q3), 2N7002 ×6, BSS84 ×3, AP63203, AON6354 ×6.
 4. Crystal (3225) — heat-sensitive, place carefully.
 5. Protection FETs Q1/Q2 (AON6354 DFN5×6), shunt resistors (2512).
 6. Shielded inductors — bulky, place last.
@@ -821,7 +853,7 @@ Cut USB cable to J5 pads → pull BOOT low + pulse EN → flash firmware → ser
 ### 10.4 Balancer Verification
 
 Set adjacent simulated cells to 3.800V and 3.650V (150mV delta, above 30mV threshold).
-- Oscilloscope on Q_H/Q_L gate pair: confirm 50kHz complementary drive with dead-time gap
+- Oscilloscope on Q_H/Q_L gate pair: confirm 15kHz complementary drive with dead-time gap; verify gate swings (Si2301: TOP→TOP−6.2V max; Si2302: BOT→MID)
 - Inline ammeter on higher-voltage cell PSU: confirms current flowing out (transferring to lower cell)
 - Delta closes over 2–3 minutes
 
@@ -829,7 +861,7 @@ Repeat for each of the 3 instances. Test a non-adjacent transfer (C1 and C4 offs
 
 ### 10.5 UART Protocol Verification
 
-Connect CP2102 to J4 → send `PING` → `PONG` within 10ms (awake) or 50ms (from sleep) → send `CELL_ALL` → four mV values matching PSU set points ±5mV → trigger OVP → confirm `FAULT:OVP:CELL1` arrives unsolicited within 100ms → `SET_BALANCE_INTERVAL:120` → `ACK` → power cycle → verify interval persisted in NVS.
+Connect CP2102 to J4 → send `PING` → `PONG` within 10ms (awake) or ~150–300ms (from deep sleep; first PING consumed as wake edge — retry) → send `CELL_ALL` → four mV values matching PSU set points ±5mV → trigger OVP → confirm `FAULT:OVP:CELL1` arrives unsolicited within 100ms → `SET_BALANCE_INTERVAL:120` → `ACK` → power cycle → verify interval persisted in NVS.
 
 ### 10.6 Charger Board Verification
 
@@ -859,7 +891,7 @@ Connect CP2102 to J4 → send `PING` → `PONG` within 10ms (awake) or 50ms (fro
 - **Cells:** 8× same-batch Samsung 30Q (or 35E / NCR18650GA). Spot-welded nickel strip preferred. 14AWG mains <200mm. 26AWG taps away from power leads.
 - **Connectors:** XT30 power (male on board, female on cable). JST-XH cell taps. JST-SH UART. No dupont on any current-carrying path.
 - **PVDD decoupling at TAS5825M:** 2×470µF low-ESR + 4×10µF X7R (1210) + 4×100nF 0402. Absorbs bass transients before they propagate back through BMS shunt.
-- **Mounting:** M3 nylon standoffs ≥10mm. ≥10mm clearance between charger board and audio signal traces. Antenna edge of BMS board faces outward (toward speaker vent or clear enclosure wall).
+- **Mounting:** M3 nylon standoffs ≥10mm. ≥10mm clearance between charger board and audio signal traces. BMS board oriented so chip antenna edge faces outward (toward speaker vent or clear enclosure wall, away from battery cells).
 
 ### 11.2 Scaling Checklist (Future)
 
@@ -873,7 +905,7 @@ Connect CP2102 to J4 → send `PING` → `PONG` within 10ms (awake) or 50ms (fro
 
 ### 11.3 Portfolio / Curriculum Summary
 
-This project demonstrates: multi-cell Li-ion protection and management · 4-switch synchronous buck-boost with external FET design · USB-C PD negotiation (sink and source) via FUSB302 + firmware policy engine · inductive active cell balancing · bare ESP32-S3 SoC RF layout (PCB trace antenna, microstrip impedance, crystal design) · BQ76920 analog front-end integration with Kelvin sensing · deep-sleep embedded firmware architecture with interrupt-driven wake · I2C multi-device bus management · UART command protocol design and companion library architecture · distributed CAN bus architecture with galvanic isolation · hardware fault interlock design · 4-layer PCB with thermal via stack, inner GND plane, and antenna keepout · multi-stage test methodology with threshold measurement and verification.
+This project demonstrates: multi-cell Li-ion protection and management · 4-switch synchronous buck-boost with external FET design · USB-C PD negotiation (sink and source) via FUSB302 + firmware policy engine · inductive active cell balancing · bare ESP32-S3 SoC RF layout (1206 chip antenna matching network, crystal design) · BQ76920 analog front-end integration with Kelvin sensing · deep-sleep embedded firmware architecture with interrupt-driven wake and pre-sleep peripheral management · I2C multi-device bus management · UART command protocol design and companion library architecture · distributed CAN bus architecture with galvanic isolation · hardware fault interlock design · 4-layer PCB with thermal via stack and inner GND plane · multi-stage test methodology with threshold measurement and verification.
 
 ---
 
@@ -882,11 +914,12 @@ This project demonstrates: multi-cell Li-ion protection and management · 4-swit
 | Decision | Choice | Rationale |
 |---|---|---|
 | Protection IC | BQ76920 | ±1mV accuracy, I2C to ESP32, configurable thresholds, hardware defaults active before/without firmware. Replaces S-8254AA entirely — no redundant sense lines. Mouser/Digikey stocked. |
-| Active balancing | Discrete Si2302 ×6 + TC4427 ×3 + 4.7µH ×3, ESP32 LEDC 50kHz | No sourceable autonomous balancer IC exists. Commodity parts, any-to-any transfer, full firmware control. BQ76920 BALx passive path unused. Runs every 60s wake regardless of charge/discharge state. |
+| Active balancing | Discrete Si2301/Si2302 half-bridges + 2N7002/BSS84 level shifters + 22µH ×3, ESP32 LEDC **15kHz** | No sourceable autonomous balancer IC exists. Level-shifted P+N topology solves the floating-gate problem a ground-referenced driver cannot (TC4427 rejected: 4.5V min supply + cannot reach elevated gates). ~1A transfer. BQ76920 BALx unused. Runs every 60s wake regardless of charge/discharge state. |
 | 3.3V supply | **AP63203 synchronous buck** | Direct B+ input (12–16.8V) → 3.3V. No LDO needed — ESP32-S3 tolerates switching supply; BQ76920 has internal analog LDO. Sourced from B+ so ESP32 stays powered through any protection FET event. ~50µA IQ. Shielded inductor placed away from antenna and VC sense lines. |
 | Shunt | 3mΩ 1% 2W | BQ76920 OCD max register = 56mV. At 8mΩ max trip = 7A (wrong). At 3mΩ: 18.7A trip (correct for this load). |
-| MCU | ESP32-S3 bare SoC + W25Q64 + 40MHz crystal | Full RF layout control, smaller footprint vs module. Requires 4-layer board for antenna keepout and microstrip reference plane. Native USB = flash + JTAG + serial via 4 pads, no bridge IC. |
-| BMS board layers | **4-layer** (revised from 2-layer) | Bare SoC PCB trace antenna needs inner GND plane for microstrip impedance and all-layer keepout void. Module would allow 2-layer; bare SoC does not. |
+| MCU | ESP32-S3 bare SoC + W25Q64 + 40MHz crystal + 1206 chip antenna | Full RF control, smaller footprint vs module. 1206 chip antenna replaces trace antenna — top-layer clearance only, inner plane continuous, better enclosure performance. Native USB = flash + JTAG + serial via 4 pads. |
+| BMS board layers | **4-layer** | Bare SoC needs inner GND plane for chip antenna π-match reference and crystal guard ring stitching. Balancer FET switching beside ±1mV sense lines benefits from plane separation. Inner plane fully continuous with chip antenna (no keepout void). |
+| Antenna | **1206 ceramic chip antenna** (Johanson 2450AT18A100E) | Replaces PCB trace antenna. Top-layer clearance only (~3mm front, ~1mm sides). Inner GND plane continuous — no all-layer keepout void. Better performance inside speaker enclosure. Hand-solderable. ~€0.30. |
 | Charger board layers | **4-layer** | BQ25713B + FET switching EMI, CC line integrity beside 5A VBUS, inner GND plane thermal mass. |
 | Charger IC | **BQ25713B** | 3.5–24V input (all PD voltages + legacy chargers), 4S native, I2C, external FETs, OTG 5V/3A or 9V/2.2A, ~$3.20 Digikey 100 units. Sourcing confirmed. |
 | Charger comms ownership | **BMS ESP32** | BMS ESP32 owns BQ76920 + FUSB302 + BQ25713B on the same I2C bus. Charging and OTG decisions are battery-state-aware (SOC, temp, cell voltage) in the same firmware context. Amp ESP32 is completely uninvolved — charger board + BMS board is a standalone charging system usable in any project. |
@@ -895,9 +928,92 @@ This project demonstrates: multi-cell Li-ion protection and management · 4-swit
 | FETs (all positions) | **AON6354 DFN5×6** | 30V, 83A, 5.2mΩ @ Vgs=4.5V. Single part across entire BOM: BMS CHG/DSG + charger 4-switch stage. Exposed drain pad bonds directly to PCB copper pour — better thermal spreading than SO-8. No heatsink needed on either board. |
 | Heatsink | **None required** | AON6354 ultra-low Rds distributes losses trivially. BQ25713B controller dissipates ~0.5W (no switching losses in controller IC). Total charger board dissipation ~1W. No single component stressed. |
 | Inductor (charger) | 4.7µH Isat ≥5A shielded, single | BQ25713B uses single-inductor 4-switch topology. Isat ≥5A covers 2.5A charge + ripple margin. |
-| Scaling model | Stack identical nodes over isolated CAN | One PCB design: speaker → powerwall. ISO1050 + B0305S-1W + dual daisy ports + DIP ID + 120Ω jumper as ~€5 unpopulated optionality. |
+| Scaling model | Stack identical nodes over isolated CAN | One PCB design: speaker → powerwall. ISO1042 + B0305S-1W + dual daisy ports + DIP ID + 120Ω jumper as ~€5 unpopulated optionality. |
 | USB-A output | **Removed** | BQ25713B OTG provides 5V/3A (15W) or 9V/2.2A (20W) from same USB-C port. Separate USB-A + AP62300 + inductor eliminated. |
+
 
 ---
 
-*End of document — Rev 6.0*
+## 13. Pre-Schematic Design Review — Findings & Required Configuration
+
+This section documents the full design review performed before schematic entry (Rev 6.0 → 6.1). Items marked ✅ are already corrected in this document; items marked ⚠ are configuration or verification steps to perform during schematic/firmware work.
+
+### 13.1 Critical corrections applied (✅)
+
+1. **✅ Balancer gate drive redesigned.** The original TC4427-driven design had two fatal flaws: the TC4427 requires a ≥4.5V supply (we have 3.3V), and — more fundamentally — the balancer FET gates for instances B and C float 3.7–16.8V above ESP32 ground, unreachable by any ground-referenced driver. Corrected to P-ch/N-ch half-bridges with 2N7002/BSS84 open-drain level shifters and zener gate clamps (§2.3). Switching frequency reduced 50kHz → **15kHz** (resistor-pullup shifters are too slow at 50kHz), inductors 4.7µH → **22µH**, balance current ~1A.
+2. **✅ Series Schottky (SS34) removed from the main B+ path.** A 3A diode in a 12A path would overheat and fail, while wasting ~5W. Reverse protection is the keyed JST-XH connector; the BQ76920 REGSRC line gets its own 1kΩ + 5.1V zener protection per datasheet.
+3. **✅ UART deep-sleep wake corrected.** The ESP32-S3 cannot wake from deep sleep on UART data (light-sleep only feature). The RX pin is now specified as an EXT falling-edge wake source — the host's first `PING` start bit wakes the chip (~150–300ms full reboot, RTC RAM intact); the companion library retries automatically.
+4. **✅ BQ25713B requires two sense resistors** (R_AC between ACP/ACN for input current, R_SR between SRP/SRN for charge current) **and two bootstrap caps** (BTST1/BTST2 — one per high-side FET). BOM corrected.
+5. **✅ ISO1050 → ISO1042.** The ISO1050's logic side requires 4.5–5.5V — incompatible with 3.3V TWAI. The ISO1042's VIO pin accepts 1.71–5.5V. Direct swap, same isolation architecture.
+6. **✅ Pre-charge FET upsized.** 2N7002 (300mA) replaced with Si2302 + 22Ω (0.76A peak inrush, ~250ms PVDD soft-start).
+7. **✅ Charger-board NTC removed** — the BQ25713 has no TS pin. Thermal charge derating is firmware: BMS ESP32 reads cell NTCs via BQ76920 and reduces Ichg over I2C.
+8. **✅ AP63203 corrected to 2A** (not 3A; family: AP632xx = 2A, AP633xx = 3A), IQ ~22µA, TSOT-26. 2A covers worst-case load with margin.
+9. **✅ Flash package fixed** — W25Q64JVSSIQ is SOIC-8; the WSON-8 variant is W25Q64JVZPIQ.
+10. **✅ Antenna vendor corrected** — 2450AT18A100E is a Johanson Technology part (not Molex).
+11. **✅ Charger J2 → 5-pin JST-SH** (GND/3.3V/SDA/SCL/INT). I2C pull-ups on the BMS side only — one set per bus.
+
+### 13.2 BQ76920 — required configuration & behavioral notes (⚠)
+
+- **⚠ FETs are OFF at power-up.** CHG_ON / DSG_ON bits (SYS_CTRL2) default to 0 — the host must enable them. An unprogrammed board outputs nothing (safe). Once enabled, all protections act **autonomously in hardware** even if the ESP32 crashes.
+- **⚠ OCD/SCD faults latch in SYS_STAT** — the corresponding FET stays off until the host clears the status bit over I2C. This is not auto-recovery; the firmware fault handler must clear flags after evaluating the cause. (OV/UV release with hysteresis but also set status bits to clear.)
+- **⚠ Set RSNS = 1** in PROTECT1 — the 56mV OCD / upper threshold table assumes the high-range setting.
+- **⚠ SCD threshold must be ≥ 89mV** (= 29.7A at 3mΩ). The minimum SCD setting (44mV = 14.7A) would sit *below* the 18.7A OCD trip and fire first. Recommended: SCD = 89mV or 111mV.
+- **⚠ OV/UV trip registers** (OV_TRIP, UV_TRIP) must be written at first boot — program 4.20V / 2.80V (or chosen values) and verify with the bench-PSU test (§10.3) after configuration, not before.
+- **⚠ Boot circuit on TS1:** the BQ76920 boots from SHIP mode when TS1 is pulled high momentarily. Provide: the NTC network per datasheet + a small boot pushbutton footprint + an ESP32 GPIO via diode to TS1 so firmware can wake the AFE programmatically.
+
+### 13.3 BQ25713B — required configuration (⚠)
+
+- **⚠ I2C watchdog:** ChargeOption0 enables a watchdog (~175s default) that suspends charging if the host goes silent. Either disable the WDT at init, or keep the ESP32 awake / on a short wake interval while ACOK is high (recommended — power budget is irrelevant while an adapter is connected).
+- **⚠ MinSystemVoltage / charge voltage registers:** program for 4S (16.8V max charge, MinSysVoltage ≈ 12.0V) at init; verify output on a dummy load before connecting the pack (§10.6).
+- **⚠ Follow the datasheet §Typical Application exactly** — including the optional input ACFET/RBFET back-to-back N-FET pair (ACDRV-driven) for input reverse blocking and OTG port isolation. Budget 2× additional AON6354 positions on the schematic; populate per the reference design if OTG is used.
+- **⚠ ILIM_HIZ and PROCHOT pins** need their strap/divider networks per datasheet even if unused.
+
+### 13.4 ESP32-S3 bare-SoC checklist (⚠)
+
+- **EN pin RC:** 10kΩ pull-up + 1µF to GND (power-on reset timing).
+- **Strapping pins:** GPIO0 (BOOT button, pulled up), GPIO46 (pulled down/floating per guidelines), GPIO45 (sets VDD_SPI voltage — leave per 3.3V flash), GPIO3 — review the strapping table in the hardware design guidelines before assigning any of these to balancer/level-shifter duty.
+- **Wake-capable pins:** ALERT, FUSB302 INT, UART RX, and CAN RX must all land on **RTC-capable GPIOs (GPIO0–21)** for EXT wake to function.
+- **Native USB:** D− = GPIO19, D+ = GPIO20 — reserved, routed only to J5 pads.
+- **Flash connects to the dedicated SPI pins** (SPICS0/SPIQ/SPID/SPICLK/SPIHD/SPIWP) — not arbitrary GPIO.
+
+### 13.5 System-level verifications (⚠)
+
+- Charger output → BMS CHG path inrush: small (converter soft-starts); the pre-charge circuit covers the discharge side only — confirmed adequate.
+- When the BQ25713B is unpowered, its battery-side node remains connected to the converter FETs' body diodes — system-level disconnect is provided by the **BMS CHG FET**, which the BQ76920/ESP32 controls. No additional isolation FET required on the charger board.
+- UART 3.3V pin on J4: optional supply to a host dongle — leave unconnected in the speaker cable to avoid back-feeding the amp board's own 3.3V rail.
+- JLCPCB 4-layer with 2oz outer copper is a supported (non-default) option — select explicitly at order time.
+
+---
+
+## 14. Datasheet Library — Schematic Reference PDFs
+
+Direct links for every IC and key component. TI `/lit/ds/symlink/` links always redirect to the latest datasheet revision. If any other link rots, search `<part number> datasheet pdf` — all are current production parts.
+
+| Part | Function | Datasheet |
+|---|---|---|
+| BQ76920 | BMS AFE / protection | https://www.ti.com/lit/ds/symlink/bq76920.pdf |
+| BQ25713 / BQ25713B | Buck-boost charger controller | https://www.ti.com/lit/ds/symlink/bq25713.pdf |
+| FUSB302B | USB-C PD PHY | https://www.onsemi.com/pdf/datasheet/fusb302b-d.pdf |
+| ESP32-S3 (SoC) | MCU | https://www.espressif.com/sites/default/files/documentation/esp32-s3_datasheet_en.pdf |
+| ESP32-S3 HW Design Guidelines | RF / strapping / layout bible | https://docs.espressif.com/projects/esp-hardware-design-guidelines/en/latest/esp32s3/ |
+| W25Q64JV | 8MB NOR flash | https://www.winbond.com/hq/product/code-storage-flash-memory/serial-nor-flash/?__locale=en&partNo=W25Q64JV |
+| AON6354 | Power N-FET (all positions) | https://aosmd.com/res/data_sheets/AON6354.pdf |
+| AP63203 | 3.3V 2A buck | https://www.diodes.com/assets/Datasheets/AP63200-AP63201-AP63203-AP63205.pdf |
+| Si2301 | P-ch FET (balancer high-side) | https://www.vishay.com/docs/70628/si2301bds.pdf |
+| Si2302 | N-ch FET (balancer low-side, pre-charge) | https://www.vishay.com/en/product/63597/ |
+| 2N7002 | Level shifter N-FET | https://assets.nexperia.com/documents/data-sheet/2N7002.pdf |
+| BSS84 | Level shifter P-FET | https://assets.nexperia.com/documents/data-sheet/BSS84.pdf |
+| BZT52C6V2 | 6.2V gate-clamp zener | https://www.diodes.com/assets/Datasheets/ds18004.pdf |
+| ISO1042 | Isolated CAN transceiver | https://www.ti.com/lit/ds/symlink/iso1042.pdf |
+| B0305S-1WR2 | Isolated 3.3V→5V DC-DC | https://www.mornsun-power.com/html/products/681/B0305S-1WR2.html |
+| PESD1CAN | CAN bus ESD | https://assets.nexperia.com/documents/data-sheet/PESD1CAN.pdf |
+| PC817 | Fault-line optocoupler | https://global.sharp/products/device/lineup/data/pdf/datasheet/PC817XxNSZ1B_e.pdf |
+| 2450AT18A100E | 1206 chip antenna + matching app note | https://www.johansontechnology.com/datasheets/2450AT18A100/2450AT18A100.pdf |
+| TAS5825M | Amplifier (system context) | https://www.ti.com/lit/ds/symlink/tas5825m.pdf |
+| FA-238 (40MHz) | Crystal | https://www5.epsondevice.com/en/products/crystal_unit/fa238v.html |
+
+**Schematic-day workflow suggestion:** open BQ76920 §"Typical Application," BQ25713 §"Application and Implementation," FUSB302B application schematic, and the ESP32-S3 hardware design guidelines side by side — those four reference circuits, plus §2.3's balancer topology and §13's configuration notes, are the complete blueprint. Draw power stages first (charger → BMS FET path → buck), then the AFE and sense networks, then the MCU block, then comms/CAN last.
+
+---
+
+*End of document — Rev 6.1*
