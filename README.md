@@ -176,21 +176,96 @@ Q_H on: inductor charges from upper group. Q_L on: inductor discharges into lowe
 
 Autonomous active balancer ICs are a sourcing dead end: ETA3000 (unreliable LCSC/Mouser stock), LT8584 (custom flyback transformer per cell), LTC3300 (SPI host + coupled inductors, automotive overkill). TI's own E2E forum confirms no standalone single-chip active balancer exists in their catalog. The discrete circuit — Si2302 pairs + TC4427 + standard shielded inductor — is commodity parts available everywhere, and a stronger portfolio piece: the balancer is designed, not bought.
 
-### 2.4 ESP32-S3 Integration
+### 2.4 ESP32-S3 Integration — Bare SoC Design
 
-**Why ESP32-S3:** native USB (flash/JTAG/serial via D+/D− — no bridge IC), deep sleep ~10µA, TWAI (CAN) controller on-chip (only a transceiver is external when scaling), LEDC hardware PWM for balancer drive, WiFi for webapp, 8MB flash for LittleFS frontend. Use the **ESP32-S3-MINI-1** module — antenna, flash, shielding included.
+This design uses the **ESP32-S3 bare SoC** (not a module), paired with an external 8MB NOR flash and 40MHz crystal, with a PCB trace antenna. This gives full control over the RF section, smaller footprint, and no module cost premium — but it transfers all RF design responsibility to the PCB, which has direct implications for layer count, layout discipline, and component placement.
 
-**Power budget (60s wake interval):**
+#### Core components for the bare SoC subsystem
+
+| Ref | Component | Part / Value | Package | Notes |
+|---|---|---|---|---|
+| U2 | MCU | ESP32-S3 (bare SoC) | QFN-56 | Native USB, TWAI, LEDC, WiFi/BT. |
+| U_FL | NOR Flash | Winbond W25Q64JVSSIQ (8MB) | SOIC-8 or WSON-8 | SPI/QSPI interface. WSON-8 preferred for footprint. LCSC / Mouser stocked. |
+| X1 | Crystal | 40MHz ±10ppm | 3225 SMD | Epson FA-238 or equivalent. Verify load capacitance (CL) against chosen part — typically 8–10pF. |
+| C_X1, C_X2 | Crystal load caps | Per CL formula: C_ext = 2×CL − C_stray | 0402 | C_stray ≈ 3–5pF on a 4-layer board. For CL=10pF: C_ext ≈ 2×10−5 = 15pF each. Verify against crystal datasheet. |
+| C_decoup | SoC power decoupling | 10µF + 100nF per VDD domain | 0402/0805 | ESP32-S3 has multiple supply pins: VDD3P3, VDD3P3_RTC, VDD3P3_CPU, VDD_SDIO, VDD3P3_USB (if used). Decouple each independently, within 0.5mm. |
+| L_RFC | RF matching inductor | 0Ω placeholder or tuned per antenna | 0402 | π-match network on LNA_IN. Espressif provides reference values. Start with their recommended network; tune only if RF performance is measured to need it. |
+| C_RFC1, C_RFC2 | RF matching caps | Per Espressif antenna reference schematic | 0402 | Shunt caps in π-match. Values typically 1–2pF. |
+
+#### 40MHz Crystal — layout rules
+
+The crystal is one of the most noise-sensitive components on the board. A noisy crystal causes jitter on the CPU clock and can corrupt WiFi/BT carrier frequency.
+
+- Place the crystal as close as physically possible to the XTAL_P / XTAL_N pins of the SoC — trace length under 5mm, ideally 2–3mm
+- Load capacitors (C_X1, C_X2) placed symmetrically at the crystal, equidistant from each pad
+- **No vias** on the XTAL_P / XTAL_N traces
+- Ground guard ring around the crystal cell on the top layer, stitched to the inner ground plane with vias every 1mm
+- Ground pour on all layers directly beneath the crystal — solid thermal and electromagnetic shielding
+- No switching traces (balancer FETs, power polygons, SPI lines) routed under or adjacent to the crystal. Minimum 3mm clearance from any switching node
+
+#### 8MB NOR Flash — layout rules
+
+- Place flash as close as possible to the SoC FSPI pins (CLK, D0–D3, CS)
+- Keep all SPI traces under 15mm, roughly equal length — not tight differential-pair matching, but avoid one trace being 3× longer than others
+- 100nF decoupling directly at flash VCC pin + 1µF on the same node
+- Route on inner layer if top layer is congested near the SoC — inner layer routing with ground reference planes above and below gives clean signal integrity
+
+#### PCB Trace Antenna — the most critical layout requirement
+
+The PCB trace antenna is a tuned microstrip element. Its performance depends entirely on:
+
+**1. Antenna keepout zone:**
+No copper on **any layer** — top, bottom, or inner — within the keepout region. Espressif specifies this precisely in the ESP32-S3 hardware design guidelines (document ESP32-S3 Hardware Design Guidelines, Section "PCB Antenna"):
+- Keepout in front of the antenna trace: minimum 3mm, preferably 5mm
+- Keepout extends to the board edge — the antenna should face outward toward a clear edge
+- No ground plane, no signal traces, no power pours, no vias in this zone on any layer
+- The inner ground plane (layer 2 on a 4-layer board) must also be absent in the keepout — this is why a module's keepout only applies to adjacent layers, but a bare SoC trace antenna requires a full-depth void
+
+**2. Antenna trace impedance — microstrip calculation:**
+The trace antenna is a 50Ω microstrip. Its width depends on the dielectric height between the trace (layer 1) and the ground plane (layer 2). On the JLC7628 4-layer stackup:
+- Layer 1 to layer 2 prepreg thickness: ~0.21mm (verify from JLC stackup spec at order time)
+- Dielectric constant εr: ~4.6 (FR4)
+- 50Ω microstrip width at these dimensions: approximately **0.38–0.42mm**
+- Calculate with a microstrip calculator (KiCad has one built-in: Edit → Board Setup → Net Classes, or use Saturn PCB Toolkit) using the actual JLC values — do not guess
+
+**3. Antenna placement:**
+- Place at a corner or edge of the board, oriented so the keepout faces outward (away from the board)
+- The balancer FETs, power polygon, and BQ76920 must be on the opposite side of the board from the antenna — maximum physical separation from switching noise sources
+- No metal enclosure, no battery cells, no wiring directly in front of the antenna plane
+
+**4. RF matching network (π-match on LNA_IN):**
+The ESP32-S3 LNA_IN pin connects to the antenna via a π-match network. Use the reference values from Espressif's hardware design guide for the PCB trace antenna. The network consists of two shunt components and one series component — leave 0Ω placeholders for the series element so the network can be tuned if needed, but use the reference values as the starting point.
+
+#### Power domains — ESP32-S3 bare SoC
+
+The bare SoC has more supply pins than a module and each must be correctly decoupled:
+
+| Pin | Supply | Decoupling |
+|---|---|---|
+| VDD3P3 | 3.3V | 10µF + 100nF |
+| VDD3P3_RTC | 3.3V | 100nF (close to pin) |
+| VDD3P3_CPU | 3.3V | 10µF + 100nF |
+| VDD_SDIO | 3.3V (or 1.8V) | 10µF + 100nF — this powers FSPI to flash |
+| VDD3P3_USB | 3.3V | 100nF — USB PHY supply |
+| GND / GNDIO / GNDPWR | Ground | Solid via-stitched connection to plane |
+
+Place each decoupling cap within 0.5mm of its respective pin. On a QFN-56, many pins are adjacent — map the datasheet pin table to physical pad locations before placing decoupling.
+
+#### Power budget (60s wake interval)
 
 | State | Current |
 |---|---|
 | Deep sleep | ~10µA |
-| Active (balance cycle / UART reply / fault handling) | ~80mA |
-| WiFi webapp mode | ~120–180mA |
+| Active (balance / UART / fault) | ~80mA |
+| WiFi webapp | ~120–180mA |
 
-Average: (0.1s × 80mA + 59.9s × 0.01mA)/60 ≈ **0.14mA** → ~0.2mAh/day from a 6Ah pack. Negligible — below cell self-discharge.
+Average: (0.1s × 80mA + 59.9s × 0.01mA) / 60 ≈ **0.14mA** → ~0.2mAh/day from a 6Ah pack. Negligible.
 
-**Wake sources:** RTC timer (balance interval) · BQ76920 ALERT GPIO interrupt (faults, immediate) · UART RX (host command) · CAN RX GPIO edge (node mode only).
+**Wake sources:** RTC timer (balance interval) · BQ76920 ALERT GPIO (immediate, fault) · UART RX · CAN RX GPIO edge (node mode).
+
+#### BOM additions vs module approach
+
+The bare SoC adds to the BOM vs a module: external flash (W25Q64, ~€0.60), crystal + load caps (~€0.30), RF matching network passives (~€0.05), and decoupling caps (~€0.20). Total: ~€1.15 additional. Saved module premium is typically €2–4. Net: cheaper, smaller, more control, more design work.
 
 ### 2.5 Programming Interface — Native USB Pads
 
@@ -215,7 +290,9 @@ Route D+/D− as a matched-length differential pair, no vias if possible.
 | Ref | Component | Part / Value | Package | Qty | Notes |
 |---|---|---|---|---|---|
 | U1 | AFE / protection | TI BQ76920 | TSSOP-20 | 1 | All measurement + hardware protection. I2C 0x08. Mouser/LCSC stocked. |
-| U2 | MCU | ESP32-S3-MINI-1 | Module | 1 | Native USB, TWAI, LEDC, WiFi. |
+| U2 | MCU | ESP32-S3 bare SoC | QFN-56 | 1 | Native USB, TWAI, LEDC, WiFi. Requires external flash + crystal — see §2.4 for full subsystem BOM. |
+| U_FL | NOR Flash | W25Q64JVSSIQ 8MB | WSON-8 | 1 | QSPI to ESP32-S3 FSPI pins. 100nF + 1µF decoupling at VCC. |
+| X1 | Crystal | 40MHz ±10ppm | 3225 | 1 | E.g. Epson FA-238. Load caps per crystal datasheet CL — typically 2× 15pF at CL=10pF. |
 | U3 | 3.3V LDO | XC6210B332 | SOT-89 | 1 | Low IQ (~55µA) — critical for sleep budget. Not AMS1117 (5mA IQ would dominate). |
 | Q1, Q2 | CHG / DSG FETs | AO4407A 30V 15A 8mΩ ×2 | SO-8 | 2 | Back-to-back source-to-source on B− rail. Driven by BQ76920 CHG/DSG pins. |
 | Q3 | Pre-discharge FET | 2N7002 | SOT-23 | 1 | Optional. Soft-starts PVDD bulk caps via R2 — prevents inrush SCD trip. |
@@ -235,7 +312,7 @@ Route D+/D− as a matched-length differential pair, no vias if possible.
 | C4, C5 | BQ76920 decoupling | 100nF + 10nF | 0402 | 2 | — |
 | C6–C9 | VC filter C | 0.1µF ×4 | 0402 | 4 | At VC pins to GND. |
 | C10–C12 | Balancer bootstrap | 100nF ×3 | 0402 | 3 | — |
-| C13–C18 | ESP32 decoupling | 10µF + 100nF per rail | 0402/0805 | 6 | Per module datasheet. |
+| C13–C22 | ESP32-S3 decoupling | 10µF + 100nF per VDD domain | 0402/0805 | 10 | One pair per supply pin: VDD3P3, VDD3P3_RTC, VDD3P3_CPU, VDD_SDIO, VDD3P3_USB. Within 0.5mm each. |
 | C19 | LDO output | 10µF X7R | 0805 | 1 | — |
 | NTC1 | Cell NTC | 100kΩ B=3950 | leaded | 1 | Epoxied to cell body → TS1. |
 | NTC2 | FET NTC | 100kΩ B=3950 | 0402 | 1 | Near Q1/Q2 → TS2. |
@@ -272,11 +349,19 @@ Route D+/D− as a matched-length differential pair, no vias if possible.
 
 **Balancer instances:** each placed adjacent to its two cell-tap nodes; inductor loop area minimised; TC4427 near the gates, not near the ESP32.
 
+**PCB trace antenna and RF keepout — highest-priority placement rule:**
+Place the antenna at a board corner or edge, facing outward. The following zone rules apply on **every layer including inner planes:**
+- No copper of any kind (fills, traces, vias, pours) within the keepout — inner plane voids must be designed explicitly in KiCad and verified in the gerber before ordering
+- All switching noise sources (balancer FETs, power polygons, XT30 connectors) must be on the **opposite end of the board** from the antenna — maximum physical separation
+- The 50Ω microstrip antenna trace width must be calculated from the actual JLC7628 layer 1→layer 2 dielectric (typically ~0.21mm, εr ~4.6) using a microstrip calculator — approximately 0.38–0.42mm, verify before routing
+
+**Crystal keepout:** ground guard ring around the crystal, stitched to layer 2 plane every 1mm. No switching traces within 3mm. XTAL_P/XTAL_N traces under 5mm, no vias.
+
+**USB D+/D−:** matched-length differential pair to J5 pads, no vias.
+
 **Isolation barrier (if CAN populated):** the ISO1050 + B0305S straddle a physical gap in the PCB copper — **no copper, no traces, no planes cross the barrier** except through the isolator and DC-DC packages. ≥4mm creepage. Bus-side ground pour is its own island fed only by B0305S output.
 
-**Ground:** one continuous plane for the node logic/power (no analog/digital split — BQ76920 datasheet recommends unified ground). The isolated CAN island is the only separate ground, by design.
-
-**USB D+/D−:** matched differential pair to J5 pads.
+**Ground:** one continuous inner layer 2 plane for the entire node logic/power area (excluding antenna keepout void and CAN isolation island). BQ76920 datasheet recommends unified ground — do not split.
 
 ---
 
@@ -398,10 +483,12 @@ Inductors tight to SW pins, parallel, ≥3× body-height apart; caps placed alon
 
 | Board | Layers | Copper | Reasoning |
 |---|---|---|---|
-| BMS node | **2** | 2oz | DC-to-kHz signals, one 12A polygon, 50kHz shielded balancer inductors, no thermally critical IC. 4-layer adds ~€15–20/run for nothing measurable. Spend the effort on Kelvin routing and the isolation gap instead. |
-| Charger | **4** | 2oz outer / 1oz inner | QFN dissipating 4.2W (inner GND plane cuts θJA ~30–40%); 250kHz × 4 switching nodes need a reference plane 0.2mm below; CC lines beside 5A VBUS need shielding. Without it, 65W OTG hits thermal shutdown (§6). |
+| BMS node | **4** (revised) | 2oz outer / 1oz inner | Bare ESP32-S3 SoC PCB trace antenna requires a solid inner ground plane (layer 2) for the microstrip impedance reference and antenna keepout void on all layers; 50kHz balancer FETs switching beside ±1mV BQ76920 sense lines benefit from plane separation; SoC QFN-56 thermal via stack; crystal ground guard. A module's internal ground plane and shield can handle this — a bare SoC on a 2-layer board transfers the full RF burden to your copper, and an interrupted 2-layer ground plane around the antenna keepout significantly degrades RF performance. 4-layer is the correct answer for a bare SoC design. |
+| Charger | **4** | 2oz outer / 1oz inner | Unchanged — IP2368 QFN-28 at 4.2W needs inner GND plane for thermal (drops θJA ~30–40%); 250kHz 4-switch buck-boost needs reference plane 0.2mm below switching nodes; CC lines beside 5A VBUS benefit from shielding. Without 4-layer, 65W OTG hits thermal shutdown (§6). |
 
-JLCPCB 4-layer stackup: JLC7628 default, 1.6mm.
+Both boards are now 4-layer — same JLCPCB process, same stackup (JLC7628 default, 1.6mm), same order. No separate 2-layer run needed. Stackup: Signal (top, 2oz) / GND (inner 1, 1oz) / Power or signal (inner 2, 1oz) / Signal (bottom, 2oz).
+
+> **Antenna keepout reminder:** on the BMS board, the inner GND plane (layer 2) must have a copper void in the antenna keepout zone — just as the top and bottom layers do. On JLC7628, specify this void in your gerbers. The inner plane void must match or slightly exceed the top-layer keepout boundary. Verify in KiCad's 3D viewer and DRC before ordering.
 
 ---
 
@@ -509,10 +596,10 @@ UART 115200 8N1, ASCII + `\n`. `PING` first to wake (~5ms).
 
 | | BMS node | Charger |
 |---|---|---|
-| Layers / copper | 2 / 2oz | 4 / 2oz-1oz-1oz-2oz |
+| Layers / copper | **4 / 2oz outer, 1oz inner** | 4 / 2oz outer, 1oz inner |
 | Finish | ENIG | ENIG |
-| Vias | open | **tented bottom under U1** (fab note) |
-| Stencil | frameless, yes | frameless, yes — mandatory for QFN-28/TSSOP-20 |
+| Vias | open (specify inner plane antenna keepout void in gerbers) | **tented bottom under U1** (fab note) |
+| Stencil | frameless, yes | frameless, yes — mandatory for QFN-56/TSSOP-20/QFN-28 |
 | Thickness | 1.6mm | 1.6mm |
 
 ### 9.2 Reflow (SAC305)
@@ -597,11 +684,8 @@ Power electronics (PD buck-boost, inductive active balancing) · mixed-signal (K
 | Isolation | Galvanic, per node | Series stacking puts node grounds 14.8–44V apart; shared comm ground = dead short through the bus. Non-negotiable. |
 | Fault interlock | Opto-coupled hardware FAULT line | Stack-wide e-stop independent of CAN/firmware health. |
 | Shunt | 3mΩ 1% 2W | BQ76920 OCD register max 56mV → 18.7A trip; 8mΩ would cap trip at 7A. |
-| MCU | ESP32-S3-MINI-1 | Native USB (4 pads = flash+JTAG+serial, no bridge IC, no USB-C), TWAI on-chip, 10µA sleep, WiFi webapp. |
-| LDO | XC6210 (not AMS1117) | 55µA vs 5mA quiescent — AMS1117 would be 500× the sleep budget. |
-| Charger | IP2368, bidirectional | 65W PD both ways; speaker is also a power bank. Si2301 blocks unpowered body-diode back-feed. |
-| Charger inductors | 4.7µH **Isat ≥8A** ×2 | Hard-boost peaks 8–10A; 5A parts saturate; paralleling doesn't raise Isat. |
-| Layers | BMS 2-layer / charger 4-layer | Match complexity to need; inner GND plane is the charger's thermal/EMI requirement, not the node's. |
+| MCU | **ESP32-S3 bare SoC** + W25Q64 8MB NOR flash + 40MHz crystal | Full RF layout control, smaller footprint, ~€1.15 BOM add vs ~€2–4 module premium. Requires antenna keepout void on all 4 layers, microstrip width from JLC7628 stackup, crystal guard ring. Worth it — the RF design itself is portfolio material. |
+| Layers | **Both boards 4-layer** | Charger: QFN thermal + 250kHz switching planes. BMS: bare SoC PCB trace antenna needs solid inner GND plane for microstrip impedance reference, and antenna keepout void must clear all inner layers — 2-layer insufficient for bare SoC. Same process both boards, one JLCPCB run. |
 | Heatsink | 20×20×8mm, PCB-bottom, silicone pad, M2 | θJA 20→12°C/W; 65W OTG: 109°C→75°C junction. |
 | Host I/F | UART JST-SH, ASCII + library | Any MCU can host it; doubles as dev monitor; CAN is the scale-out path, UART the local one. |
 
