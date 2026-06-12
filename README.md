@@ -3,7 +3,7 @@
 **Scalable Smart BMS Node · USB-C PD Charger Board**  
 Primary application: Bluetooth Speaker / TAS5825M Amplifier Platform  
 Architecture: Distributed modular BMS — single node now, stackable via CAN later  
-*Revision 6.1 — Pre-Schematic Design Review · June 2026 · Arik Nel*
+*Revision 6.2 — Dual Balancing Mode · June 2026 · Arik Nel*
 
 ---
 
@@ -34,7 +34,7 @@ This is not a BMS for one speaker. It is a **self-contained, open-source, progra
 
 Each node handles its own:
 - Hardware cell protection (BQ76920 — operates even with no firmware)
-- Active cell balancing (ESP32-driven discrete inductive balancer)
+- Cell balancing — **passive** (BQ76920 BALx + bleed resistors, firmware-controlled, runs during deep sleep) **or active** (discrete inductive half-bridges, ESP32 LEDC 15kHz) — firmware-selected, mutually exclusive
 - SOC tracking (coulomb counting via BQ76920 current sense)
 - Telemetry (UART host interface + WiFi webapp)
 - Optional networking (CAN bus with galvanic isolation — footprints designed in, populated only when scaling)
@@ -120,29 +120,46 @@ SOC coulomb counting · configurable threshold adjustment · fault logging with 
 
 ### 2.3 Active Cell Balancing — Discrete, ESP32-Driven
 
-#### The BQ76920 is not involved in balancing
+#### Both passive and active balancing implemented — firmware selects
 
-The BQ76920 has built-in passive balancing (BALx pins). **This design does not use it.** CELLBAL registers stay 0x00, BALx pins unconnected. The BQ76920's only balancing role is voltage measurement.
+The BQ76920 has built-in passive balancing via its BALx pins — external bleed resistors on each BALx output dissipate energy from the highest cell as heat. **This design uses it** as the default balancing mode. The discrete half-bridge circuit provides active (inductive) balancing as an alternative mode. Both share the same decision logic; only the actuation differs. The two modes are **mutually exclusive** — running both simultaneously would burn energy the active circuit just transferred.
+
+**Mode selection:** stored in NVS, changeable at runtime via `SET_BALANCE_MODE:PASSIVE` or `SET_BALANCE_MODE:ACTIVE` over UART. Default: `PASSIVE` — simpler, no audible switching noise inside the speaker enclosure, adequate for a 6Ah pack cycling daily. Switch to `ACTIVE` once the discrete circuit is verified on the bench.
+
+**Key difference in behaviour during deep sleep:**
+- Passive: BQ76920 latches the CELLBAL bit in hardware — **bleeding continues during deep sleep** without the ESP32 awake. The ESP32 sets the bit and sleeps; it clears it on the next wake when delta closes.
+- Active: requires the ESP32 awake and LEDC running — **stops during deep sleep**.
 
 True active balancing requires external hardware the BQ76920 cannot drive: complementary FET half-bridges switching an inductor at 15kHz. The ESP32 drives that hardware directly via LEDC + discrete level shifters. The BQ76920 measures; the ESP32 and discrete FETs act.
 
 ```
-1. ESP32 reads VC1–VC4 from BQ76920 over I2C    ← BQ76920's only involvement
-2. ESP32 computes deltas, picks transfer path
-3. ESP32 drives level shifters → FET gates @15kHz ← BQ76920 not involved
-4. Inductor shuttles charge between cell groups
+Passive mode (default):
+1. ESP32 reads VC1–VC4 from BQ76920 over I2C     ← measurement
+2. ESP32 picks highest cell, writes CELLBAL1 bit  ← actuation
+3. BQ76920 BALx pin pulls down → bleed resistor dissipates energy from that cell
+4. ESP32 enters deep sleep — BQ76920 latches CELLBAL, bleeding continues autonomously
+5. Next wake: re-read voltages → if delta < 10mV, clear CELLBAL → stop
+
+Active mode:
+1. ESP32 reads VC1–VC4 from BQ76920 over I2C     ← measurement
+2. ESP32 computes transfer path (source cell → destination cell)
+3. ESP32 drives level shifters → Si2301/Si2302 gates at 15kHz ← BQ76920 not involved
+4. 22µH inductor shuttles charge between cell groups (~1A average)
+5. ESP32 must stay awake — active mode stops when ESP32 sleeps
 ```
 
-#### Balancing runs continuously — not only during charging
+#### Balancing runs every wake cycle — both modes
 
-The balancer connects to cell tap nodes and transfers charge whenever the ESP32 wakes and finds a delta — during charge, discharge, or at rest. Same routine every wake cycle:
+The balancer decision logic runs every wake cycle regardless of charge/discharge state:
 
 - Wake every 60s (configurable via NVS / `SET_BALANCE_INTERVAL` UART command)
 - Read 4 group voltages from BQ76920
-- If max−min > 30mV: run relevant balancer instance(s) for up to 30s
-- Re-check voltages, sleep
+- If max−min > 30mV: actuate the selected mode
+  - Passive: write CELLBAL1, sleep — BQ76920 bleeds until next wake clears it
+  - Active: run relevant instance(s) for up to 30s, stop, re-read
+- If max−min < 10mV (hysteresis): clear CELLBAL (passive) or stop LEDC (active)
 
-60s is conservative: at 2A transfer current a 100mAh imbalance resolves over ~5–6 wake cycles. Longer intervals (120–300s) work equally well; shorter gains nothing. Interval is NVS-persisted.
+Interval is NVS-persisted. At ~80mA passive bleed current, a 100mAh imbalance resolves in ~75 minutes of cumulative bleed time across multiple sleep cycles. At ~1A active transfer the same resolves in ~6 minutes of active run time.
 
 #### Why no balancer IC
 
@@ -320,7 +337,7 @@ Route D+/D− as matched-length differential pair, no vias.
 | R2 | Pre-charge resistor | 22Ω 1W | 2512 | 1 | With Q3. Peak inrush 16.8V/22Ω = 0.76A. |
 | R3, R4 | FET gate R | 1kΩ ×2 | 0402 | 2 | Q1/Q2 main protection FET gate damping. |
 | R5 | Q3 pull-down | 100kΩ | 0402 | 1 | Holds Q3 off when control line floating. |
-| R6–R9 | VC filter R | 100Ω ×4 | 0402 | 4 | With C6–C9: ~16kHz LPF per VC line. Rejects 15kHz balancer noise and harmonics. |
+| R_BAL1–4 | Passive balance bleed resistors | 68Ω ±5% 0.25W ×4 | 0402 | 4 | One per BALx pin (BAL1–BAL4). BALx pin sinks current through resistor to cell negative — ~54mA bleed per cell at 3.7V. Value sets bleed current: I = Vcell / R. 68Ω chosen for ~55mA (conservative, low heat). Footprint on BALx pin → cell tap node. |
 | R10–R15 | Balancer gate R | 10Ω ×6 | 0402 | 6 | Switching edge damping per FET gate. |
 | R16, R17 | I2C pull-ups | 4.7kΩ ×2 | 0402 | 2 | SDA/SCL to 3.3V, near BQ76920. |
 | R18, R19 | BQ76920 REGSRC divider | Per datasheet Table 1 | 0402 | 2 | Sets BQ76920 internal LDO input from pack voltage. |
@@ -715,7 +732,15 @@ The BMS ESP32 owns the entire charging and OTG decision chain. The FUSB302 IRQ p
 
 ### 7.3 Balancing Algorithm
 
-Every wake: read 4 voltages → find max/min → if Δ>30mV select transfer path (direct adjacent or chained for non-adjacent) → drive instance(s) for ≤30s via LEDC 15kHz with firmware dead-time → re-read → sleep. Runs identically charging, discharging, or at rest. SOC drift-corrects against OCV table after ≥5min rest.
+### 7.3 Balancing Algorithm
+
+Every wake: read 4 voltages → find max/min → evaluate delta:
+
+**Passive mode (default):** Δ > 30mV → write CELLBAL1 for highest cell → sleep. BQ76920 bleeds ~55mA autonomously. Next wake: Δ < 10mV → clear CELLBAL. Passive bleed persists across sleep cycles uninterrupted.
+
+**Active mode:** Δ > 30mV → select transfer path (direct adjacent or chained for non-adjacent) → drive instance(s) for ≤30s via LEDC 15kHz with firmware dead-time → re-read → if Δ < 10mV stop. Active only runs while ESP32 is awake.
+
+Both modes: SOC drift-corrects against OCV table after ≥5min rest. Mode loaded from NVS on boot.
 
 ### 7.3 WiFi Webapp Mode
 
@@ -853,11 +878,11 @@ Cut USB cable to J5 pads → pull BOOT low + pulse EN → flash firmware → ser
 ### 10.4 Balancer Verification
 
 Set adjacent simulated cells to 3.800V and 3.650V (150mV delta, above 30mV threshold).
-- Oscilloscope on Q_H/Q_L gate pair: confirm 15kHz complementary drive with dead-time gap; verify gate swings (Si2301: TOP→TOP−6.2V max; Si2302: BOT→MID)
-- Inline ammeter on higher-voltage cell PSU: confirms current flowing out (transferring to lower cell)
-- Delta closes over 2–3 minutes
+**Passive mode test:** set adjacent simulated cells to 3.800V and 3.650V → confirm `BALANCE_STATE` UART response shows `ACTIVE:n` → measure BALx pin pulled low on correct channel → confirm 55mA bleed current on that cell PSU → delta closes over multiple wake cycles.
 
-Repeat for each of the 3 instances. Test a non-adjacent transfer (C1 and C4 offset) — confirm both intermediate instances activate as needed.
+**Active mode test:** send `SET_BALANCE_MODE:ACTIVE` → set same 150mV delta → oscilloscope on Q_H/Q_L gate pair: confirm 15kHz complementary drive with dead-time gap; verify gate swings (Si2301: TOP→TOP−6.2V max; Si2302: BOT→MID) → inline ammeter confirms current transfer → delta closes over 2–3 minutes.
+
+Repeat active test for each of the 3 instances. Test a non-adjacent transfer (C1 and C4 offset) — confirm both intermediate instances activate as needed. Send `SET_BALANCE_MODE:PASSIVE` → confirm mode persists across power cycle.
 
 ### 10.5 UART Protocol Verification
 
@@ -914,7 +939,7 @@ This project demonstrates: multi-cell Li-ion protection and management · 4-swit
 | Decision | Choice | Rationale |
 |---|---|---|
 | Protection IC | BQ76920 | ±1mV accuracy, I2C to ESP32, configurable thresholds, hardware defaults active before/without firmware. Replaces S-8254AA entirely — no redundant sense lines. Mouser/Digikey stocked. |
-| Active balancing | Discrete Si2301/Si2302 half-bridges + 2N7002/BSS84 level shifters + 22µH ×3, ESP32 LEDC **15kHz** | No sourceable autonomous balancer IC exists. Level-shifted P+N topology solves the floating-gate problem a ground-referenced driver cannot (TC4427 rejected: 4.5V min supply + cannot reach elevated gates). ~1A transfer. BQ76920 BALx unused. Runs every 60s wake regardless of charge/discharge state. |
+| Balancing | **Both passive and active — firmware selects** | Passive: BQ76920 BALx + 68Ω bleed resistors (~55mA), continues during deep sleep, default mode. Active: Si2301/Si2302 half-bridges + 2N7002/BSS84 level shifters + 22µH ×3, ESP32 LEDC 15kHz, ~1A transfer, stops during deep sleep. Mutually exclusive — mode stored in NVS, switchable via UART `SET_BALANCE_MODE`. TC4427 rejected: 4.5V min supply + floating gate problem. |
 | 3.3V supply | **AP63203 synchronous buck** | Direct B+ input (12–16.8V) → 3.3V. No LDO needed — ESP32-S3 tolerates switching supply; BQ76920 has internal analog LDO. Sourced from B+ so ESP32 stays powered through any protection FET event. ~50µA IQ. Shielded inductor placed away from antenna and VC sense lines. |
 | Shunt | 3mΩ 1% 2W | BQ76920 OCD max register = 56mV. At 8mΩ max trip = 7A (wrong). At 3mΩ: 18.7A trip (correct for this load). |
 | MCU | ESP32-S3 bare SoC + W25Q64 + 40MHz crystal + 1206 chip antenna | Full RF control, smaller footprint vs module. 1206 chip antenna replaces trace antenna — top-layer clearance only, inner plane continuous, better enclosure performance. Native USB = flash + JTAG + serial via 4 pads. |
@@ -940,7 +965,7 @@ This section documents the full design review performed before schematic entry (
 
 ### 13.1 Critical corrections applied (✅)
 
-1. **✅ Balancer gate drive redesigned.** The original TC4427-driven design had two fatal flaws: the TC4427 requires a ≥4.5V supply (we have 3.3V), and — more fundamentally — the balancer FET gates for instances B and C float 3.7–16.8V above ESP32 ground, unreachable by any ground-referenced driver. Corrected to P-ch/N-ch half-bridges with 2N7002/BSS84 open-drain level shifters and zener gate clamps (§2.3). Switching frequency reduced 50kHz → **15kHz** (resistor-pullup shifters are too slow at 50kHz), inductors 4.7µH → **22µH**, balance current ~1A.
+1. **✅ Balancer gate drive redesigned + dual mode implemented.** The original TC4427-driven design had two fatal flaws: ≥4.5V supply requirement and floating gates unreachable by any ground-referenced driver. Corrected to P-ch/N-ch half-bridges with 2N7002/BSS84 open-drain level shifters and zener gate clamps (§2.3). Switching frequency 50kHz → **15kHz**, inductors 4.7µH → **22µH**, ~1A transfer current. **Both passive (BQ76920 BALx + 68Ω bleed resistors) and active (discrete half-bridges) are implemented.** Firmware selects via NVS-stored mode enum. Default: PASSIVE. Passive continues during deep sleep; active stops when ESP32 sleeps. Modes are mutually exclusive.
 2. **✅ Series Schottky (SS34) removed from the main B+ path.** A 3A diode in a 12A path would overheat and fail, while wasting ~5W. Reverse protection is the keyed JST-XH connector; the BQ76920 REGSRC line gets its own 1kΩ + 5.1V zener protection per datasheet.
 3. **✅ UART deep-sleep wake corrected.** The ESP32-S3 cannot wake from deep sleep on UART data (light-sleep only feature). The RX pin is now specified as an EXT falling-edge wake source — the host's first `PING` start bit wakes the chip (~150–300ms full reboot, RTC RAM intact); the companion library retries automatically.
 4. **✅ BQ25713B requires two sense resistors** (R_AC between ACP/ACN for input current, R_SR between SRP/SRN for charge current) **and two bootstrap caps** (BTST1/BTST2 — one per high-side FET). BOM corrected.
@@ -1016,4 +1041,4 @@ Direct links for every IC and key component. TI `/lit/ds/symlink/` links always 
 
 ---
 
-*End of document — Rev 6.1*
+*End of document — Rev 6.2*
